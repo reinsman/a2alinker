@@ -1,0 +1,5 @@
+- Check boundary conditions, error paths and cancellation behavior.
+- Check data ownership, persistence and concurrent access.
+- Compare the change with the caller's expectations and protocol contracts.
+- Prefer a reproducible failure or a precise execution path over speculation.
+- Distinguish checked behavior from assumptions.

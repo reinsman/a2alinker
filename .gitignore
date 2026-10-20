@@ -1,0 +1,7 @@
+/target/
+/data/
+/.a2alinker/
+.env
+*.db
+*.db-shm
+*.db-wal

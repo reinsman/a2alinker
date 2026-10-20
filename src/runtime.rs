@@ -1,0 +1,753 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+use anyhow::{Context, Result, anyhow, ensure};
+use ra2a::types::{
+    Artifact, Message, Part, PartContent, Role, StreamResponse, Task, TaskArtifactUpdateEvent,
+    TaskState, TaskStatus, TaskStatusUpdateEvent,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::{
+    sync::{Mutex, broadcast, mpsc},
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    adapters::{
+        self, AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome,
+    },
+    config::Config,
+    skills::SkillSet,
+    storage::{Store, metadata},
+};
+
+pub const INTERACTION_EXTENSION: &str = "urn:a2alinker:interaction:v1";
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: i32,
+    pub message: String,
+}
+impl ApiError {
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+        }
+    }
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: -32004,
+            message: message.into(),
+        }
+    }
+    pub fn not_found() -> Self {
+        Self {
+            code: -32001,
+            message: "Task not found".into(),
+        }
+    }
+}
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for ApiError {}
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        tracing::error!(error = %error, "gateway operation failed");
+        Self {
+            code: -32603,
+            message: "Internal gateway error; see server logs".into(),
+        }
+    }
+}
+pub type ApiResult<T> = std::result::Result<T, ApiError>;
+
+struct Work {
+    task_id: String,
+    prompt: String,
+}
+struct Control {
+    cancel: CancellationToken,
+    replies: mpsc::Sender<InteractionReply>,
+}
+struct QueuedControl {
+    cancel: CancellationToken,
+    replies: mpsc::Receiver<InteractionReply>,
+}
+struct SessionEntry {
+    session: Box<dyn AgentSession>,
+    used: Instant,
+}
+
+pub struct Gateway {
+    pub config: Arc<Config>,
+    pub skills: SkillSet,
+    pub store: Arc<Store>,
+    pub fingerprint: String,
+    queue: mpsc::Sender<Work>,
+    controls: Mutex<HashMap<String, Control>>,
+    queued: Mutex<HashMap<String, QueuedControl>>,
+    mutation: Mutex<()>,
+    changes: broadcast::Sender<()>,
+    shutdown: CancellationToken,
+    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Gateway {
+    pub async fn open(mut config: Config) -> Result<Arc<Self>> {
+        config.agent.workspace = config
+            .agent
+            .workspace
+            .canonicalize()
+            .context("canonicalize workspace")?;
+        config.validate()?;
+        let discovered = SkillSet::discover(&config)?;
+        for cap in &config.capabilities {
+            for skill in &cap.required_skills {
+                ensure!(
+                    discovered.skills.iter().any(|s| &s.name == skill),
+                    "capability {} requires unavailable skill {skill}",
+                    cap.id
+                );
+            }
+        }
+        let store = Arc::new(Store::open(&config.storage.directory).await?);
+        let skills = discovered.snapshot(&config.storage.directory)?;
+        let fingerprint = config.fingerprint(&skills.digest)?;
+        let home = adapters::prepare_home(&config, &skills.digest)?;
+        let config = Arc::new(config);
+        let adapter = AdapterContext {
+            config: config.clone(),
+            skills: skills.clone(),
+            home,
+        };
+        // Verify protocol support and the selected skills before advertising readiness.
+        let preflight_id = uuid::Uuid::new_v4().to_string();
+        let preflight = tokio::time::timeout(
+            Duration::from_secs(config.runtime.startup_timeout_seconds),
+            adapters::create_session(&adapter, &preflight_id, None),
+        )
+        .await
+        .context("agent preflight timed out")??;
+        drop(preflight);
+        let (queue, receiver) = mpsc::channel(config.runtime.queue_capacity);
+        let (changes, _) = broadcast::channel(256);
+        let gateway = Arc::new(Self {
+            config,
+            skills,
+            store,
+            fingerprint,
+            queue,
+            controls: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashMap::new()),
+            mutation: Mutex::new(()),
+            changes,
+            shutdown: CancellationToken::new(),
+            worker: Mutex::new(None),
+        });
+        for task in gateway.store.tasks().await? {
+            if !task.status.state.is_terminal() {
+                gateway.finish(task.id.as_str(), TaskState::Failed, Some("Gateway restarted; previous execution was interrupted and was not replayed".into())).await?;
+            }
+        }
+        let handle = tokio::spawn(worker(
+            Arc::downgrade(&gateway),
+            receiver,
+            adapter,
+            gateway.shutdown.clone(),
+        ));
+        *gateway.worker.lock().await = Some(handle);
+        Ok(gateway)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    pub async fn task(&self, id: &str) -> ApiResult<Task> {
+        self.store.task(id).await?.ok_or_else(ApiError::not_found)
+    }
+
+    pub async fn submit(&self, message: Message) -> ApiResult<Task> {
+        if self.shutdown.is_cancelled() {
+            return Err(ApiError::unsupported("Gateway is shutting down"));
+        }
+        if message.role != Role::User
+            || message.id.as_str().is_empty()
+            || message.id.as_str().len() > 256
+            || message.parts.is_empty()
+        {
+            return Err(ApiError::invalid(
+                "messageId, ROLE_USER and nonempty parts are required",
+            ));
+        }
+        if message
+            .context_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 256)
+        {
+            return Err(ApiError::invalid("contextId must contain 1..=256 bytes"));
+        }
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&message).map_err(anyhow::Error::from)?)
+        );
+        let _guard = self.mutation.lock().await;
+        if let Some((stored_digest, task_id)) = self.store.duplicate(message.id.as_str()).await? {
+            if stored_digest != digest {
+                return Err(ApiError::invalid(
+                    "messageId was already used with different content",
+                ));
+            }
+            return self.task(&task_id).await;
+        }
+        if let Some(task_id) = &message.task_id {
+            return self.reply(task_id.as_str(), &message, &digest).await;
+        }
+        if message.parts.iter().any(|p| {
+            !matches!(p.content, PartContent::Text(_))
+                || p.media_type.as_deref().is_some_and(|m| m != "text/plain")
+        }) {
+            return Err(ApiError {
+                code: -32005,
+                message: "New tasks accept text/plain parts only".into(),
+            });
+        }
+        let prompt = message
+            .text_content()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| ApiError::invalid("prompt must not be empty"))?;
+        let context_id = message
+            .context_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(context) = self.store.context(&context_id).await?
+            && context.fingerprint != self.fingerprint
+        {
+            return Err(ApiError::invalid(
+                "Context belongs to different execution configuration; create a new context",
+            ));
+        }
+        if self.store.active_context(&context_id).await? {
+            return Err(ApiError::unsupported("Context already has an active task"));
+        }
+        let permit = self
+            .queue
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| ApiError::unsupported("Task queue is full; retry later"))?;
+        let mut task = Task::new(uuid::Uuid::new_v4().to_string(), context_id);
+        task.history.push(
+            message
+                .clone()
+                .with_context_id(task.context_id.as_str())
+                .with_task_id(task.id.clone()),
+        );
+        metadata(&mut task).insert(
+            "a2alinker".into(),
+            json!({"agent":self.config.agent.kind.as_str(),"configDigest":self.fingerprint,
+            "skillsDigest":self.skills.digest,"runId":uuid::Uuid::new_v4().to_string()}),
+        );
+        self.store
+            .insert_task(&task, message.id.as_str(), &digest, &self.fingerprint)
+            .await?;
+        let (replies, receiver) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        self.controls.lock().await.insert(
+            task.id.to_string(),
+            Control {
+                cancel: cancel.clone(),
+                replies,
+            },
+        );
+        self.queued.lock().await.insert(
+            task.id.to_string(),
+            QueuedControl {
+                cancel,
+                replies: receiver,
+            },
+        );
+        permit.send(Work {
+            task_id: task.id.to_string(),
+            prompt,
+        });
+        let _ = self.changes.send(());
+        Ok(task)
+    }
+
+    async fn reply(&self, id: &str, message: &Message, digest: &str) -> ApiResult<Task> {
+        let mut task = self.task(id).await?;
+        if message
+            .context_id
+            .as_ref()
+            .is_some_and(|ctx| ctx != task.context_id.as_str())
+        {
+            return Err(ApiError::invalid("taskId and contextId do not match"));
+        }
+        if !task.status.state.is_interrupted() {
+            return Err(ApiError::invalid(
+                "Existing task only accepts replies while awaiting input; use contextId for a new task",
+            ));
+        }
+        let pending = task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pendingInteraction"))
+            .cloned()
+            .ok_or_else(|| ApiError::unsupported("Task has no pending interaction"))?;
+        let interaction: Interaction =
+            serde_json::from_value(pending).map_err(anyhow::Error::from)?;
+        if message.parts.len() != 1 {
+            return Err(ApiError::invalid(
+                "Interaction reply requires exactly one data part",
+            ));
+        }
+        let PartContent::Data(data) = &message.parts[0].content else {
+            return Err(ApiError::invalid("Interaction reply requires a data part"));
+        };
+        if data["interactionId"].as_str() != Some(&interaction.id) {
+            return Err(ApiError::invalid("Interaction id mismatch"));
+        }
+        let response = data
+            .get("response")
+            .ok_or_else(|| ApiError::invalid("Interaction reply missing response"))?;
+        adapters::validate_reply(&interaction, response)
+            .map_err(|e| ApiError::invalid(e.to_string()))?;
+        let controls = self.controls.lock().await;
+        let control = controls
+            .get(id)
+            .ok_or_else(|| ApiError::unsupported("Task execution is no longer active"))?;
+        if control.cancel.is_cancelled() {
+            return Err(ApiError::unsupported("Task is being canceled"));
+        }
+        let permit = control
+            .replies
+            .try_reserve()
+            .map_err(|_| ApiError::unsupported("A reply is already pending"))?;
+        task.history
+            .push(message.clone().with_context_id(task.context_id.as_str()));
+        metadata(&mut task).remove("pendingInteraction");
+        task.status = TaskStatus::working();
+        let event = status_event(&task);
+        self.store
+            .record_reply(&task, message, digest, &event)
+            .await?;
+        permit.send(InteractionReply {
+            id: interaction.id,
+            response: response.clone(),
+        });
+        let _ = self.changes.send(());
+        Ok(task)
+    }
+
+    pub async fn wait(&self, id: &str, interrupted: bool) -> ApiResult<Task> {
+        let mut changes = self.subscribe();
+        loop {
+            let task = self.task(id).await?;
+            if task.status.state.is_terminal()
+                || (interrupted && task.status.state.is_interrupted())
+            {
+                return Ok(task);
+            }
+            let _ = changes.recv().await;
+        }
+    }
+
+    pub async fn cancel(&self, id: &str) -> ApiResult<Task> {
+        {
+            let _guard = self.mutation.lock().await;
+            let task = self.task(id).await?;
+            if task.status.state == TaskState::Canceled {
+                return Ok(task);
+            }
+            if task.status.state.is_terminal() {
+                return Err(ApiError {
+                    code: -32002,
+                    message: "Task is already terminal".into(),
+                });
+            }
+            if let Some(control) = self.controls.lock().await.get(id) {
+                control.cancel.cancel();
+            } else {
+                return Err(ApiError::unsupported("Task has no live execution"));
+            }
+            // A queued task can be canceled without waiting for the currently running task.
+            if task.status.state == TaskState::Submitted {
+                let mut task = task;
+                task.status = TaskStatus::new(TaskState::Canceled);
+                self.store.save_event(&task, &status_event(&task)).await?;
+                let _ = self.changes.send(());
+                return Ok(task);
+            }
+        }
+        let task = self.wait(id, false).await?;
+        if task.status.state != TaskState::Canceled {
+            return Err(ApiError {
+                code: -32002,
+                message: "Task finished before cancellation could take effect".into(),
+            });
+        }
+        Ok(task)
+    }
+
+    async fn event(&self, id: &str, event: AgentEvent) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        let mut task = self.store.task(id).await?.context("task disappeared")?;
+        if task.status.state.is_terminal() {
+            return Ok(());
+        }
+        let protocol_event = match event {
+            AgentEvent::OutputDelta { item_id, text } => {
+                output_event(&mut task, &item_id, &text, true, false)
+            }
+            AgentEvent::OutputComplete { item_id, text } => {
+                output_event(&mut task, &item_id, &text, false, true)
+            }
+            AgentEvent::Progress(text) => {
+                if !task.status.state.is_interrupted() {
+                    task.status = TaskStatus::with_message(
+                        TaskState::Working,
+                        Message::agent_text(text)
+                            .with_task_id(task.id.clone())
+                            .with_context_id(task.context_id.as_str()),
+                    );
+                }
+                status_event(&task)
+            }
+            AgentEvent::Interaction(interaction) => {
+                ensure!(
+                    task.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("pendingInteraction"))
+                        .is_none(),
+                    "parallel interactions are unsupported"
+                );
+                metadata(&mut task).insert(
+                    "pendingInteraction".into(),
+                    serde_json::to_value(&interaction)?,
+                );
+                let msg = Message::agent(vec![Part::data(json!({"interaction":interaction}))])
+                    .with_task_id(task.id.clone())
+                    .with_context_id(task.context_id.as_str());
+                task.status = TaskStatus::with_message(TaskState::InputRequired, msg);
+                status_event(&task)
+            }
+        };
+        let output_bytes: usize = task
+            .artifacts
+            .iter()
+            .flat_map(|a| &a.parts)
+            .filter_map(Part::as_text)
+            .map(str::len)
+            .sum();
+        ensure!(
+            output_bytes <= self.config.runtime.max_output_bytes,
+            "Task output exceeded max_output_bytes"
+        );
+        self.store.save_event(&task, &protocol_event).await?;
+        let _ = self.changes.send(());
+        Ok(())
+    }
+
+    async fn finish(&self, id: &str, state: TaskState, detail: Option<String>) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        let mut task = self.store.task(id).await?.context("task disappeared")?;
+        if !task.status.state.is_terminal() {
+            task.status = match detail {
+                Some(text) => TaskStatus::with_message(
+                    state,
+                    Message::agent_text(text)
+                        .with_task_id(task.id.clone())
+                        .with_context_id(task.context_id.as_str()),
+                ),
+                None => TaskStatus::new(state),
+            };
+            metadata(&mut task).remove("pendingInteraction");
+            if state == TaskState::Completed {
+                let text = task
+                    .artifacts
+                    .iter()
+                    .flat_map(|a| &a.parts)
+                    .filter_map(Part::as_text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !text.is_empty() {
+                    task.history.push(
+                        Message::agent_text(text)
+                            .with_task_id(task.id.clone())
+                            .with_context_id(task.context_id.as_str()),
+                    );
+                }
+            }
+            self.store.save_event(&task, &status_event(&task)).await?;
+            let _ = self.changes.send(());
+        }
+        self.controls.lock().await.remove(id);
+        self.queued.lock().await.remove(id);
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        if let Some(worker) = self.worker.lock().await.take() {
+            let _ = worker.await;
+        }
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+fn status_event(task: &Task) -> StreamResponse {
+    StreamResponse::StatusUpdate(TaskStatusUpdateEvent::new(
+        task.id.clone(),
+        task.context_id.clone(),
+        task.status.clone(),
+    ))
+}
+
+fn output_event(
+    task: &mut Task,
+    item_id: &str,
+    text: &str,
+    append: bool,
+    final_chunk: bool,
+) -> StreamResponse {
+    let id = format!("output-{item_id}");
+    let index = task
+        .artifacts
+        .iter()
+        .position(|a| a.artifact_id.as_str() == id);
+    let actual_append = append && index.is_some();
+    if let Some(i) = index {
+        let previous = task.artifacts[i]
+            .parts
+            .iter()
+            .filter_map(Part::as_text)
+            .collect::<String>();
+        task.artifacts[i].parts = vec![Part::text(if append {
+            previous + text
+        } else {
+            text.into()
+        })];
+    } else {
+        task.artifacts
+            .push(Artifact::new(id.clone(), vec![Part::text(text)]));
+    }
+    let mut event = TaskArtifactUpdateEvent::new(
+        task.id.clone(),
+        task.context_id.clone(),
+        Artifact::new(id, vec![Part::text(text)]),
+    );
+    event.append = actual_append;
+    event.last_chunk = final_chunk;
+    StreamResponse::ArtifactUpdate(event)
+}
+
+async fn worker(
+    weak: Weak<Gateway>,
+    mut receiver: mpsc::Receiver<Work>,
+    adapter: AdapterContext,
+    shutdown: CancellationToken,
+) {
+    let mut sessions = HashMap::<String, SessionEntry>::new();
+    let mut cleanup = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        let work = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = cleanup.tick() => {
+                sessions.retain(|_, s| s.used.elapsed().as_secs() < adapter.config.runtime.session_idle_timeout_seconds && s.session.is_alive());
+                continue;
+            }
+            work = receiver.recv() => match work { Some(work) => work, None => break },
+        };
+        let Some(gateway) = weak.upgrade() else {
+            break;
+        };
+        let id = work.task_id.clone();
+        let result = execute(&gateway, &adapter, &mut sessions, work).await;
+        if let Err(error) = result {
+            tracing::error!(task_id = %id, error = %error, "task execution failed");
+            if let Err(e) = gateway
+                .finish(&id, TaskState::Failed, Some(error.to_string()))
+                .await
+            {
+                tracing::error!(error = %e, "cannot persist failed task");
+            }
+        }
+    }
+    receiver.close();
+    sessions.clear();
+    if let Some(gateway) = weak.upgrade() {
+        let ids: Vec<_> = gateway.controls.lock().await.keys().cloned().collect();
+        for id in ids {
+            let _ = gateway
+                .finish(&id, TaskState::Canceled, Some("Gateway shut down".into()))
+                .await;
+        }
+    }
+}
+
+async fn execute(
+    gateway: &Gateway,
+    adapter: &AdapterContext,
+    sessions: &mut HashMap<String, SessionEntry>,
+    work: Work,
+) -> Result<()> {
+    let task = gateway
+        .store
+        .task(&work.task_id)
+        .await?
+        .context("queued task disappeared")?;
+    if task.status.state.is_terminal() {
+        gateway.controls.lock().await.remove(&work.task_id);
+        gateway.queued.lock().await.remove(&work.task_id);
+        return Ok(());
+    }
+    let control = gateway
+        .queued
+        .lock()
+        .await
+        .remove(&work.task_id)
+        .context("queued control disappeared")?;
+    let context_id = task.context_id.to_string();
+    if control.cancel.is_cancelled() {
+        return gateway
+            .finish(&work.task_id, TaskState::Canceled, None)
+            .await;
+    }
+    {
+        let _guard = gateway.mutation.lock().await;
+        let mut task = gateway
+            .store
+            .task(&work.task_id)
+            .await?
+            .context("queued task disappeared")?;
+        if task.status.state.is_terminal() {
+            gateway.controls.lock().await.remove(&work.task_id);
+            return Ok(());
+        }
+        task.status = TaskStatus::working();
+        gateway
+            .store
+            .save_event(&task, &status_event(&task))
+            .await?;
+        let _ = gateway.changes.send(());
+    }
+    if sessions
+        .get_mut(&context_id)
+        .is_some_and(|entry| !entry.session.is_alive())
+    {
+        sessions.remove(&context_id);
+    }
+    if !sessions.contains_key(&context_id) {
+        if sessions.len() >= adapter.config.runtime.max_sessions
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, s)| s.used)
+                .map(|(id, _)| id.clone())
+        {
+            sessions.remove(&oldest);
+        }
+        let stored = gateway
+            .store
+            .context(&context_id)
+            .await?
+            .context("context disappeared")?;
+        let start = tokio::time::timeout(
+            Duration::from_secs(adapter.config.runtime.startup_timeout_seconds),
+            adapters::create_session(adapter, &context_id, stored.native_id.as_deref()),
+        );
+        let session = tokio::select! {
+            _ = control.cancel.cancelled() => return gateway.finish(&work.task_id, TaskState::Canceled, None).await,
+            _ = gateway.shutdown.cancelled() => return gateway.finish(&work.task_id, TaskState::Canceled, None).await,
+            session = start => session.context("agent startup timed out")??,
+        };
+        gateway
+            .store
+            .set_native_id(&context_id, session.native_id())
+            .await?;
+        sessions.insert(
+            context_id.clone(),
+            SessionEntry {
+                session,
+                used: Instant::now(),
+            },
+        );
+    }
+    let result = {
+        let session = &mut sessions.get_mut(&context_id).unwrap().session;
+        let (events, mut incoming) = mpsc::channel(128);
+        let run = session.run(
+            &work.prompt,
+            events,
+            control.replies,
+            control.cancel.clone(),
+        );
+        tokio::pin!(run);
+        let mut deadline =
+            Instant::now() + Duration::from_secs(adapter.config.runtime.task_timeout_seconds);
+        let mut interrupted = false;
+        let mut timed_out = false;
+        loop {
+            tokio::select! {
+                event = incoming.recv(), if !incoming.is_closed() || !incoming.is_empty() => {
+                    if let Some(event) = event
+                        && let Err(error) = gateway.event(&work.task_id, event).await { break Err(error); }
+                }
+                _ = control.cancel.cancelled(), if !interrupted => {
+                    interrupted = true;
+                    deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
+                }
+                _ = gateway.shutdown.cancelled(), if !interrupted => {
+                    control.cancel.cancel(); interrupted = true;
+                    deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if interrupted { break if timed_out { Err(anyhow!("Task timed out")) } else { Ok(RunOutcome::Canceled) }; }
+                    timed_out = true; interrupted = true; control.cancel.cancel();
+                    deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
+                }
+                result = &mut run => {
+                    let mut result = result;
+                    while let Ok(event) = incoming.try_recv() {
+                        if let Err(error) = gateway.event(&work.task_id, event).await { result = Err(error); break; }
+                    }
+                    break if timed_out { Err(anyhow!("Task timed out")) } else { result };
+                }
+            }
+        }
+    };
+    let state = match &result {
+        Ok(RunOutcome::Completed) => TaskState::Completed,
+        Ok(RunOutcome::Canceled) => TaskState::Canceled,
+        Err(_) => TaskState::Failed,
+    };
+    if state != TaskState::Completed {
+        sessions.remove(&context_id);
+    } else if let Some(session) = sessions.get_mut(&context_id) {
+        session.used = Instant::now();
+    }
+    gateway
+        .finish(&work.task_id, state, result.err().map(|e| e.to_string()))
+        .await
+}
+
+pub fn trim_history(task: &mut Task, length: Option<i32>) {
+    if let Some(n) = length {
+        let remove = task.history.len().saturating_sub(n as usize);
+        task.history.drain(..remove);
+    }
+}

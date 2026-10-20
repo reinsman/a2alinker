@@ -1,0 +1,44 @@
+schema_version = 1
+
+[server]
+listen = "127.0.0.1:8080"
+
+[identity]
+id = "pi-reviewer"
+name = "Pi Reviewer"
+description = "Review code with pi and a selected skill package."
+
+[agent]
+kind = "pi"
+workspace = ".."
+native_config = "./agents/pi/settings.json"
+inherit_auth = true
+allow_extensions = false
+# executable = "/absolute/path/to/pi"
+# provider = "your-provider"
+# model = "your-model"
+
+[skills]
+directories = ["./skills"]
+enabled = ["code-review"]
+inherit_user = false
+
+[runtime]
+max_concurrent_tasks = 1
+queue_capacity = 20
+task_timeout_seconds = 1800
+session_idle_timeout_seconds = 900
+
+[storage]
+directory = "../data/pi-reviewer"
+
+[auth]
+mode = "none"
+
+[[capabilities]]
+id = "review-code"
+name = "Code review"
+description = "Inspect code changes and explain actionable findings."
+tags = ["code", "review"]
+examples = ["Review the uncommitted changes in this repository."]
+required_skills = ["code-review"]
