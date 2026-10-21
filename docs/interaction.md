@@ -1,16 +1,16 @@
-# Input and approval extension
+# 用户输入与审批扩展
 
-URI: `urn:a2alinker:interaction:v1`.
+扩展 URI：`urn:a2alinker:interaction:v1`。
 
-This optional A2A extension forwards supported native approval/input requests. The
-gateway never interprets ordinary text as an approval. Only a holder of the instance
-credential can read tasks or respond. An instance is a single trust domain.
+这是一个可选的 A2A 扩展，用于转发受支持的原生审批和用户输入请求。
+网关不会将普通文本解释为审批。在启用实例认证时，只有持有实例凭据的调用方
+才能读取任务或回复交互请求。每个实例对应一个信任域。
 
-## Receive a request
+## 接收交互请求
 
-When the agent pauses, the task enters `TASK_STATE_INPUT_REQUIRED`. The request is
-available both in `task.metadata.pendingInteraction` and the status message's data
-part:
+agent 因等待交互而暂停时，任务进入 `TASK_STATE_INPUT_REQUIRED` 状态。
+可以从 `task.metadata.pendingInteraction` 或状态消息的 `data` 内容块中
+获取交互请求：
 
 ```json
 {
@@ -26,14 +26,19 @@ part:
 }
 ```
 
-Display the operation or question to the user. The `params` shape depends on the
-native method. Multiple simultaneous native interactions fail explicitly in this
-version. Waiting time counts toward the task timeout.
+客户端应向用户展示待审批的操作或需要回答的问题。`params` 的格式由原生方法
+决定。本版本不支持同时处理多个原生交互请求，遇到这种情况会明确报错。
+等待用户交互的时间计入任务超时。
 
-## Send a response
+## 回复交互请求
 
-POST `/a2a` with `Content-Type: application/json`, the instance authorization if
-enabled, and `A2A-Extensions: urn:a2alinker:interaction:v1`:
+向 `/a2a` 发送 POST 请求，携带以下请求头；如果实例启用了认证，还需要携带
+相应的认证凭据：
+
+- `Content-Type: application/json`
+- `A2A-Extensions: urn:a2alinker:interaction:v1`
+
+请求体示例：
 
 ```json
 {
@@ -56,26 +61,25 @@ enabled, and `A2A-Extensions: urn:a2alinker:interaction:v1`:
 }
 ```
 
-The gateway validates the task/context binding, outstanding interaction ID and
-response shape before recording it and forwarding it to the native request ID.
-Repeating the same message ID and content returns the task instead of granting the
-operation again. A late, mismatched or duplicate interaction with a new message ID
-is rejected. New native turns use a new task and the existing `contextId`.
+网关会先校验任务与会话的对应关系、待处理的交互 ID，以及响应格式，再记录
+回复，并将其转发给对应的原生请求。使用相同的消息 ID 和内容重试时，会返回
+原任务，不会再次批准操作。使用新消息 ID 提交已过期、ID 不匹配或已经处理过的
+交互回复时，会被拒绝。需要开始新一轮原生执行时，应创建新任务，并沿用已有的
+`contextId`。
 
-## Supported response shapes
+## 支持的响应格式
 
-| Native method | `response` |
+| 原生方法 | `response` 格式 |
 | --- | --- |
-| Codex `item/commandExecution/requestApproval` | `{"decision":"accept"}`, `decline`, or `cancel` |
-| Codex `item/fileChange/requestApproval` | Same choices |
-| Codex `item/tool/requestUserInput` | `{"answers":{"question-id":{"answers":["answer"]}}}`; answer every question |
-| Pi `extension_ui_request`, method `confirm` | `{"confirmed":true}` or `false` |
-| Pi method `select`, `input`, `editor` | `{"value":"answer"}` or `{"cancelled":true}` |
+| Codex `item/commandExecution/requestApproval` | `{"decision":"accept"}`、`{"decision":"decline"}` 或 `{"decision":"cancel"}` |
+| Codex `item/fileChange/requestApproval` | 与命令执行审批相同 |
+| Codex `item/tool/requestUserInput` | `{"answers":{"question-id":{"answers":["answer"]}}}`；必须回答所有问题 |
+| pi `extension_ui_request`，方法为 `confirm` | `{"confirmed":true}` 或 `{"confirmed":false}` |
+| pi 方法 `select`、`input`、`editor` | `{"value":"answer"}` 或 `{"cancelled":true}` |
 
-Session-wide permission grants and policy amendments are intentionally absent from
-this extension. Unsupported Codex server requests receive a protocol error and fail
-the task rather than being silently approved.
+本扩展不支持对整个会话授予权限，也不支持修改权限策略。遇到不支持的 Codex
+服务端请求时，会返回协议错误并将任务标记失败，不会静默批准。
 
-For continued monitoring, keep the stream open, issue a new `SubscribeToTask`, or
-poll `GetTask`. Streaming connections remain open through these interrupted states
-and close at a terminal task state.
+需要持续跟踪任务时，可以保持事件流连接、重新调用 `SubscribeToTask`，
+或通过 `GetTask` 轮询。任务处于这些等待交互的状态时，事件流连接保持打开；
+任务进入终态后，连接关闭。
