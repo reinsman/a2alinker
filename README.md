@@ -147,6 +147,8 @@ TLS 可由反向代理终止。代理应关闭 SSE 缓冲，并允许长连接�
 
 ## 开发
 
+不熟悉 Rust 时，可先读 [Rust 代码阅读指南](docs/rust-guide.md)，再按推荐顺序阅读源码中的中文注释。本包通过 `unsafe_code = "forbid"` 禁止自身源码和测试使用 unsafe；此限制不覆盖第三方依赖的内部实现。
+
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings

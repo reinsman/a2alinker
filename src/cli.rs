@@ -1,3 +1,5 @@
+//! 命令行入口：解析配置覆盖项，分派检查命令，并管理 HTTP 服务的启动和退出。
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
@@ -11,6 +13,7 @@ use crate::{
     skills::SkillSet,
 };
 
+// derive 让 clap 自动生成参数解析逻辑；下方 command/arg 属性定义命令行格式。
 #[derive(Debug, Parser)]
 #[command(
     name = "a2alinker",
@@ -24,9 +27,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start an A2A JSON-RPC + SSE server.
+    /// 启动 A2A JSON-RPC + SSE 服务。
     Serve(Box<CommonArgs>),
-    /// Check the executable and perform a protocol handshake without inference.
+    /// 检查可执行文件并完成协议握手，不发起模型推理。
     Doctor(Box<CommonArgs>),
     Config {
         #[command(subcommand)]
@@ -57,6 +60,7 @@ pub enum SkillsCommand {
 
 #[derive(Debug, Default, Args)]
 pub struct CommonArgs {
+    // Option<T> 表示参数可以不提供；只有 Some(value) 才覆盖配置文件中的值。
     #[arg(long, env = "A2ALINKER_CONFIG")]
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, env = "A2ALINKER_AGENT")]
@@ -65,7 +69,7 @@ pub struct CommonArgs {
     pub executable: Option<PathBuf>,
     #[arg(long, env = "A2ALINKER_AGENT_CONFIG")]
     pub agent_config: Option<PathBuf>,
-    /// Repeat to select skill roots; replaces directories from the config file.
+    /// 可重复指定技能根目录；会替换配置文件中的目录列表。
     #[arg(long, env = "A2ALINKER_SKILL_DIRS", value_delimiter = ';')]
     pub skill_dir: Vec<PathBuf>,
     #[arg(long, env = "A2ALINKER_WORKSPACE")]
@@ -85,6 +89,7 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
+    /// 先加载 TOML，再应用命令行/环境变量覆盖项，最后统一校验。
     pub fn resolve(&self) -> Result<Config> {
         let mut cfg = Config::load(self.config.as_deref())?;
         let cwd = std::env::current_dir()?;
@@ -141,6 +146,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let mut config = args.resolve()?;
             let version = adapters::probe(&config).await?;
             println!("Executable: {version}");
+            // 临时目录拥有自己的生命周期；离开此分支时会自动删除，不使用正式存储。
             let temp = tempfile::tempdir()?;
             config.storage.directory = temp.path().into();
             let skills = SkillSet::discover(&config)?.snapshot(temp.path())?;
@@ -152,11 +158,13 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 skills,
                 home,
             };
+            // 只创建会话、握手和验证技能，不调用 session.run()，因此不会发送推理任务。
             let session = tokio::time::timeout(
                 Duration::from_secs(seconds),
                 adapters::create_session(&context, &uuid::Uuid::new_v4().to_string(), None),
             )
             .await
+            // 两个 ? 分别处理 timeout 的外层错误、create_session 的内层错误。
             .context("protocol handshake timed out")??;
             drop(session);
             println!(
@@ -195,10 +203,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
     }
 }
 
+/// 绑定端口、预检 agent，再运行 HTTP；收到退出信号后等待任务清理完成。
 async fn serve(mut config: Config) -> Result<()> {
     let version = adapters::probe(&config).await?;
     tracing::info!(agent = config.agent.kind.as_str(), %version, "agent executable detected");
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
+    // 当配置端口为 0 时，写回系统实际分配的端口，保证 Agent Card 中地址正确。
     config.server.listen = listener.local_addr()?;
     let gateway = Gateway::open(config).await?;
     let router = match a2a::router(gateway.clone()) {
@@ -220,6 +230,7 @@ async fn serve(mut config: Config) -> Result<()> {
     result.context("A2A server failed")
 }
 
+// cfg 是条件编译：Unix 同时支持 SIGTERM 和 Ctrl+C，其他平台只编译 Ctrl+C 分支。
 async fn signal() {
     #[cfg(unix)]
     {

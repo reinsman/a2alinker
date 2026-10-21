@@ -1,3 +1,5 @@
+//! 适配器的公共接口：runtime 只认识这些类型，不依赖 pi 或 Codex 的具体报文。
+
 mod codex;
 mod pi;
 pub mod process;
@@ -34,6 +36,7 @@ pub struct InteractionReply {
     pub response: Value,
 }
 
+/// 原生协议统一成四类事件；完整文本与增量文本分开，便于正确更新产物。
 #[derive(Debug)]
 pub enum AgentEvent {
     OutputDelta { item_id: String, text: String },
@@ -55,6 +58,8 @@ pub struct AdapterContext {
     pub home: PathBuf,
 }
 
+/// trait 类似其他语言的接口；每种 agent 实现相同的会话操作。
+/// async_trait 让异步方法可通过 dyn AgentSession 调用；Send 允许所有权跨线程转移。
 #[async_trait]
 pub trait AgentSession: Send {
     fn native_id(&self) -> &str;
@@ -68,6 +73,7 @@ pub trait AgentSession: Send {
     ) -> Result<RunOutcome>;
 }
 
+/// native_id 为 Some 时恢复已有会话，否则创建新会话；返回值隐藏具体适配器类型。
 pub async fn create_session(
     context: &AdapterContext,
     context_id: &str,
@@ -83,6 +89,7 @@ pub async fn create_session(
     }
 }
 
+/// 建立实例私有的 agent 配置目录；复制所需文件，不修改用户原始配置。
 pub fn prepare_home(config: &Config, skill_digest: &str) -> Result<PathBuf> {
     let home = config
         .storage
@@ -137,6 +144,7 @@ pub fn prepare_home(config: &Config, skill_digest: &str) -> Result<PathBuf> {
     Ok(home)
 }
 
+/// 只运行 --version，附带启动超时；真实协议兼容性由后续 create_session 验证。
 pub async fn probe(config: &Config) -> Result<String> {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(config.runtime.startup_timeout_seconds),
@@ -156,6 +164,7 @@ pub async fn probe(config: &Config) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// 按原生交互类型检查字段和取值，拒绝把任意 JSON 直接作为审批结果发送给 agent。
 pub fn validate_reply(interaction: &Interaction, response: &Value) -> Result<()> {
     match interaction.method.as_str() {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {

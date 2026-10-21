@@ -1,3 +1,6 @@
+//! 任务调度中心：把 A2A 请求转成排队任务，把 agent 事件转成持久化状态和产物。
+//! 每个实例只有一个 worker 执行任务，HTTP 查询和取消仍可并发处理。
+
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
@@ -61,6 +64,7 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
+        // 服务端记录详细错误，客户端只得到通用信息，避免暴露内部路径或配置。
         tracing::error!(error = %error, "gateway operation failed");
         Self {
             code: -32603,
@@ -83,10 +87,12 @@ struct QueuedControl {
     replies: mpsc::Receiver<InteractionReply>,
 }
 struct SessionEntry {
+    // dyn 表示运行时选择具体实现；Box 拥有该会话，释放时会连带清理子进程。
     session: Box<dyn AgentSession>,
     used: Instant,
 }
 
+/// Arc 允许路由、请求和后台任务共同持有网关，不会复制整个网关及数据库。
 pub struct Gateway {
     pub config: Arc<Config>,
     pub skills: SkillSet,
@@ -95,13 +101,16 @@ pub struct Gateway {
     queue: mpsc::Sender<Work>,
     controls: Mutex<HashMap<String, Control>>,
     queued: Mutex<HashMap<String, QueuedControl>>,
+    // () 不存放业务数据；拿到锁即进入任务修改临界区，避免读改写相互覆盖。
     mutation: Mutex<()>,
+    // 广播只负责唤醒等待者；完整事件在数据库中，通知丢失不等于事件丢失。
     changes: broadcast::Sender<()>,
     shutdown: CancellationToken,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Gateway {
+    /// 初始化存储、技能与原生协议，恢复历史状态，然后启动唯一的执行 worker。
     pub async fn open(mut config: Config) -> Result<Arc<Self>> {
         config.agent.workspace = config
             .agent
@@ -129,7 +138,7 @@ impl Gateway {
             skills: skills.clone(),
             home,
         };
-        // Verify protocol support and the selected skills before advertising readiness.
+        // 正式对外报告就绪前，验证原生协议和选中技能；此时不请求模型推理。
         let preflight_id = uuid::Uuid::new_v4().to_string();
         let preflight = tokio::time::timeout(
             Duration::from_secs(config.runtime.startup_timeout_seconds),
@@ -153,11 +162,13 @@ impl Gateway {
             shutdown: CancellationToken::new(),
             worker: Mutex::new(None),
         });
+        // 重启前的任务可能已修改文件；标记失败，不自动重跑有副作用的工作。
         for task in gateway.store.tasks().await? {
             if !task.status.state.is_terminal() {
                 gateway.finish(task.id.as_str(), TaskState::Failed, Some("Gateway restarted; previous execution was interrupted and was not replayed".into())).await?;
             }
         }
+        // worker 使用 Weak 弱引用，不让空闲后台任务一直维持网关的强引用计数。
         let handle = tokio::spawn(worker(
             Arc::downgrade(&gateway),
             receiver,
@@ -176,6 +187,7 @@ impl Gateway {
         self.store.task(id).await?.ok_or_else(ApiError::not_found)
     }
 
+    /// 校验和去重后创建任务；带 taskId 的消息会转交给交互回复处理。
     pub async fn submit(&self, message: Message) -> ApiResult<Task> {
         if self.shutdown.is_cancelled() {
             return Err(ApiError::unsupported("Gateway is shutting down"));
@@ -200,6 +212,7 @@ impl Gateway {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&message).map_err(anyhow::Error::from)?)
         );
+        // guard 离开作用域时自动释放锁；去重和创建任务必须处于同一临界区。
         let _guard = self.mutation.lock().await;
         if let Some((stored_digest, task_id)) = self.store.duplicate(message.id.as_str()).await? {
             if stored_digest != digest {
@@ -239,6 +252,7 @@ impl Gateway {
         if self.store.active_context(&context_id).await? {
             return Err(ApiError::unsupported("Context already has an active task"));
         }
+        // 先预留队列容量再落库，避免创建了一个没有位置入队的任务。
         let permit = self
             .queue
             .clone()
@@ -259,6 +273,7 @@ impl Gateway {
         self.store
             .insert_task(&task, message.id.as_str(), &digest, &self.fingerprint)
             .await?;
+        // Sender 留给 HTTP 回复入口，Receiver 的所有权交给 worker，再交给 agent。
         let (replies, receiver) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         self.controls.lock().await.insert(
@@ -283,6 +298,7 @@ impl Gateway {
         Ok(task)
     }
 
+    /// 只接受与当前 interactionId 匹配的结构化回复，普通聊天文本不会触发授权。
     async fn reply(&self, id: &str, message: &Message, digest: &str) -> ApiResult<Task> {
         let mut task = self.task(id).await?;
         if message
@@ -349,6 +365,7 @@ impl Gateway {
     }
 
     pub async fn wait(&self, id: &str, interrupted: bool) -> ApiResult<Task> {
+        // 先订阅再查询，防止状态恰好在查询与订阅之间改变，导致漏掉唤醒。
         let mut changes = self.subscribe();
         loop {
             let task = self.task(id).await?;
@@ -379,7 +396,7 @@ impl Gateway {
             } else {
                 return Err(ApiError::unsupported("Task has no live execution"));
             }
-            // A queued task can be canceled without waiting for the currently running task.
+            // 排队任务可直接落为取消，无须等待当前正在执行的其他任务结束。
             if task.status.state == TaskState::Submitted {
                 let mut task = task;
                 task.status = TaskStatus::new(TaskState::Canceled);
@@ -388,6 +405,7 @@ impl Gateway {
                 return Ok(task);
             }
         }
+        // 此处已离开持锁作用域，worker 可以获得同一把锁来写入取消结果。
         let task = self.wait(id, false).await?;
         if task.status.state != TaskState::Canceled {
             return Err(ApiError {
@@ -398,6 +416,7 @@ impl Gateway {
         Ok(task)
     }
 
+    /// 将统一的 agent 事件应用到 Task，再原子保存快照和对应的 A2A 事件。
     async fn event(&self, id: &str, event: AgentEvent) -> Result<()> {
         let _guard = self.mutation.lock().await;
         let mut task = self.store.task(id).await?.context("task disappeared")?;
@@ -457,6 +476,7 @@ impl Gateway {
         Ok(())
     }
 
+    /// 终态只写入一次；清除待处理交互并释放该任务的控制通道。
     async fn finish(&self, id: &str, state: TaskState, detail: Option<String>) -> Result<()> {
         let _guard = self.mutation.lock().await;
         let mut task = self.store.task(id).await?.context("task disappeared")?;
@@ -517,6 +537,7 @@ fn status_event(task: &Task) -> StreamResponse {
     ))
 }
 
+// 文本增量追加到产物；最终完整文本覆盖同一产物，避免重复累加已收到的内容。
 fn output_event(
     task: &mut Task,
     item_id: &str,
@@ -555,6 +576,7 @@ fn output_event(
     StreamResponse::ArtifactUpdate(event)
 }
 
+// 会话表只由此 worker 持有和修改，因此不需要额外为每个会话加锁。
 async fn worker(
     weak: Weak<Gateway>,
     mut receiver: mpsc::Receiver<Work>,
@@ -564,6 +586,7 @@ async fn worker(
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(5));
     loop {
+        // select! 同时等待多个异步操作；biased 让退出信号优先得到处理。
         let work = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -600,6 +623,7 @@ async fn worker(
     }
 }
 
+// 执行一个任务：取得/恢复会话，消费事件，处理取消与超时，最后持久化终态。
 async fn execute(
     gateway: &Gateway,
     adapter: &AdapterContext,
@@ -670,6 +694,7 @@ async fn execute(
             Duration::from_secs(adapter.config.runtime.startup_timeout_seconds),
             adapters::create_session(adapter, &context_id, stored.native_id.as_deref()),
         );
+        // 启动握手也可被取消；即使 agent 没有回应，外层仍有超时保证。
         let session = tokio::select! {
             _ = control.cancel.cancelled() => return gateway.finish(&work.task_id, TaskState::Canceled, None).await,
             _ = gateway.shutdown.cancelled() => return gateway.finish(&work.task_id, TaskState::Canceled, None).await,
@@ -696,6 +721,7 @@ async fn execute(
             control.replies,
             control.cancel.clone(),
         );
+        // Future 固定位置后，可在循环中反复等待同一次 run，而不会重复启动推理。
         tokio::pin!(run);
         let mut deadline =
             Instant::now() + Duration::from_secs(adapter.config.runtime.task_timeout_seconds);
@@ -722,6 +748,7 @@ async fn execute(
                 }
                 result = &mut run => {
                     let mut result = result;
+                    // run 完成时通道中可能还有最后几条事件，先处理完，再写终态。
                     while let Ok(event) = incoming.try_recv() {
                         if let Err(error) = gateway.event(&work.task_id, event).await { result = Err(error); break; }
                     }
@@ -735,6 +762,7 @@ async fn execute(
         Ok(RunOutcome::Canceled) => TaskState::Canceled,
         Err(_) => TaskState::Failed,
     };
+    // 失败/取消时释放会话及进程；成功的会话留下以供同一 context 后续任务复用。
     if state != TaskState::Completed {
         sessions.remove(&context_id);
     } else if let Some(session) = sessions.get_mut(&context_id) {

@@ -1,3 +1,5 @@
+//! 发现、校验并复制完整技能包；摘要同时覆盖 SKILL.md 和它引用的附属文件。
+
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
@@ -10,6 +12,7 @@ use walkdir::WalkDir;
 
 use crate::config::Config;
 
+/// 一个技能包的入口和内容摘要；path 指向包内的 SKILL.md。
 #[derive(Debug, Clone, Serialize)]
 pub struct Skill {
     pub name: String,
@@ -32,6 +35,7 @@ struct Frontmatter {
 }
 
 impl SkillSet {
+    /// 借用配置，只读取源目录；按名称排序后计算摘要，使扫描结果稳定。
     pub fn discover(config: &Config) -> Result<Self> {
         let mut found = BTreeMap::<String, Skill>::new();
         let mut visited = HashSet::new();
@@ -115,6 +119,8 @@ impl SkillSet {
         })
     }
 
+    /// 取得 self 的所有权，把路径改成存储目录中的副本后返回新的技能集合。
+    /// 源技能不会被修改；临时目录复制完成后才重命名为正式目录。
     pub fn snapshot(mut self, storage: &Path) -> Result<Self> {
         let root = storage.join("skills").join(&self.digest);
         if !root.exists() {
@@ -140,6 +146,7 @@ impl SkillSet {
     }
 }
 
+// 固定遍历顺序，并校验符号链接与总大小；不仅对 Markdown 正文计算摘要。
 fn directory_digest(root: &Path) -> Result<String> {
     let mut digest = Sha256::new();
     let mut total = 0u64;
@@ -174,6 +181,7 @@ fn directory_digest(root: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+/// 递归复制包内容并保留文件权限；拒绝符号链接，以及把目标放入源目录的递归复制。
 pub fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     std::fs::create_dir_all(destination)?;
     ensure!(

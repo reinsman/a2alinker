@@ -1,3 +1,5 @@
+//! Codex app-server 适配器：一个 thread 对应原生会话，一个 turn 对应一次任务。
+
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -18,6 +20,7 @@ pub struct CodexSession {
 }
 
 impl CodexSession {
+    /// 完成初始化、技能白名单检查和 thread 创建/恢复；模型推理从 run 的 turn/start 开始。
     pub async fn start(context: &AdapterContext, native: Option<&str>) -> Result<Self> {
         let mut args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
         args.extend(context.config.agent.args.clone());
@@ -54,6 +57,7 @@ impl CodexSession {
             .iter()
             .map(|s| canonical(&s.path))
             .collect::<Result<_>>()?;
+        // 默认关闭未选中的技能；写入后重新查询，确认原生服务实际采用了该选择。
         let mut loaded = vec![];
         for entry in list["data"]
             .as_array()
@@ -177,6 +181,7 @@ impl AgentSession for CodexSession {
             .to_string();
         let mut cancelling = false;
         let mut deadline = Instant::now() + Duration::from_secs(86400 * 365);
+        // 客户端使用新的 interactionId；此表保留它与原生 JSON-RPC 请求 ID 的对应关系。
         let mut pending = HashMap::<String, Value>::new();
         loop {
             tokio::select! {
@@ -211,7 +216,7 @@ impl AgentSession for CodexSession {
                                     kind:if method.ends_with("requestApproval") { "approval" } else { "input" }.into(),
                                     method:method.into(), params:params.clone() })).await?;
                             }
-                            // Unsupported server requests must get an explicit error instead of hanging forever.
+                            // 不支持的原生请求必须明确返回错误，避免 agent 一直等待响应。
                             _ => {
                                 self.process.send(json!({"id":id,"error":{"code":-32601,"message":"Server request is not supported by a2alinker"}})).await?;
                                 bail!("unsupported Codex server request: {method}");

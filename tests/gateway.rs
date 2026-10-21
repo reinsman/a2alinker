@@ -1,3 +1,6 @@
+//! 使用独立子进程测试完整任务生命周期，不依赖真实模型，也不消耗推理额度。
+//! 重点覆盖去重、会话恢复、交互回复、SSE 和异常情况下的资源清理。
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -515,6 +518,12 @@ async fn bounded_queue_rejects_overflow_without_persisting_a_phantom_task() {
 #[cfg(unix)]
 #[tokio::test]
 async fn process_group_cleanup_kills_tools_even_after_agent_process_exits() {
+    use nix::{
+        errno::Errno,
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+
     let temp = tempfile::tempdir().unwrap();
     let mut cfg = config(&temp, AgentKind::Pi);
     let pid_file = temp.path().join("child.pid");
@@ -526,9 +535,13 @@ async fn process_group_cleanup_kills_tools_even_after_agent_process_exits() {
     let task = complete(&g, Message::user_text("crash-with-child")).await;
     assert_eq!(task.status.state, TaskState::Failed);
     let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    assert!(pid > 1, "fixture must provide an ordinary child PID");
+    let child_pid = Pid::from_raw(pid);
     let mut stopped = false;
     for _ in 0..50 {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        // None 只检查进程是否存在，不实际发送信号；ESRCH 表示进程已不存在。
+        // 其他错误（例如无权访问）不能被误判为清理成功。
+        if kill(child_pid, None) == Err(Errno::ESRCH) {
             stopped = true;
             break;
         }
@@ -536,6 +549,7 @@ async fn process_group_cleanup_kills_tools_even_after_agent_process_exits() {
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .unwrap();
+        // 僵尸进程已经停止运行，可能还在等待操作系统回收记录。
         if String::from_utf8_lossy(&status.stdout)
             .trim_start()
             .starts_with('Z')
@@ -546,9 +560,8 @@ async fn process_group_cleanup_kills_tools_even_after_agent_process_exits() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     if !stopped {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        // 断言失败前也尽量清理测试进程，避免给后续测试留下后台进程。
+        let _ = kill(child_pid, Signal::SIGKILL);
     }
     assert!(stopped, "agent tool process survived process group cleanup");
     g.shutdown().await;

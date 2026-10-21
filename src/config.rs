@@ -1,3 +1,6 @@
+//! 配置的数据结构、默认值、路径处理和校验。
+//! serde 把 TOML 映射到 Rust 结构体，执行指纹用于判断旧会话能否安全复用。
+
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -26,6 +29,8 @@ impl AgentKind {
     }
 }
 
+// derive 自动实现调试、克隆、默认值和序列化；不需要手写这些重复代码。
+// default 使用缺省值补齐字段；deny_unknown_fields 拒绝拼错或不支持的配置项。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -197,6 +202,7 @@ pub struct Capability {
 }
 
 impl Config {
+    /// None 使用默认配置；Some(path) 读取文件，相对路径以该文件所在目录为基准。
     pub fn load(file: Option<&Path>) -> Result<Self> {
         let mut cfg: Self = match file {
             Some(path) => toml::from_str(
@@ -220,6 +226,7 @@ impl Config {
         Ok(cfg)
     }
 
+    // &mut self 是独占可变借用：本方法可以改配置，调用方暂时不能同时访问它。
     fn resolve_paths(&mut self, base: &Path) -> Result<()> {
         self.agent.workspace = absolute(&self.agent.workspace, base)?;
         self.storage.directory = absolute(&self.storage.directory, base)?;
@@ -237,6 +244,7 @@ impl Config {
         Ok(())
     }
 
+    /// 校验跨字段约束；ensure! 在条件不满足时直接返回错误。
     pub fn validate(&self) -> Result<()> {
         ensure!(self.schema_version == 1, "schema_version must be 1");
         ensure!(
@@ -351,8 +359,9 @@ impl Config {
             .into()
     }
 
+    /// 对执行配置、原生配置文件和技能摘要取哈希，防止旧 context 静默换用新配置。
     pub fn fingerprint(&self, skill_digest: &str) -> Result<String> {
-        // Only execution settings affect session compatibility; credentials are hashed, never logged.
+        // 只有执行设置影响会话兼容性；其中的凭据参与哈希，但不输出明文到日志。
         let content = serde_json::to_vec(&(&self.agent, &self.skills, skill_digest))?;
         let mut digest = Sha256::new();
         digest.update(content);

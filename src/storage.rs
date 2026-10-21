@@ -1,3 +1,6 @@
+//! SQLite 持久化层：保存任务、原生会话映射、消息去重记录和 SSE 事件。
+//! 对外提供异步方法，SQL 参数通过 bind 传入，避免拼接客户端输入。
+
 use std::{fs::File, path::Path};
 
 use anyhow::{Context, Result, ensure};
@@ -9,6 +12,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
+/// 持有数据库连接池和实例文件锁；只要 Store 存活，锁文件句柄就保持打开。
 pub struct Store {
     pool: SqlitePool,
     _lock: File,
@@ -16,8 +20,8 @@ pub struct Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // Explicitly release the open-file-description lock before closing the fd.
-        // Other threads may briefly fork with the fd before their exec closes it.
+        // 关闭句柄前显式解锁：其他线程启动子进程时，fork 可能短暂继承该句柄，
+        // 直到 exec 才关闭；主动解锁可避免实例锁因此延迟释放。
         let _ = FileExt::unlock(&self._lock);
     }
 }
@@ -99,6 +103,7 @@ impl Store {
         )
     }
 
+    /// 在同一事务中创建任务、context、去重记录和初始事件，避免只写入其中一部分。
     pub async fn insert_task(
         &self,
         task: &Task,
@@ -106,6 +111,7 @@ impl Store {
         digest: &str,
         fingerprint: &str,
     ) -> Result<()> {
+        // ? 遇到错误会提前返回；事务没有 commit 就被释放时，SQLx 会安排回滚。
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT OR IGNORE INTO contexts (id,fingerprint) VALUES (?,?)")
             .bind(task.context_id.as_str())
@@ -154,6 +160,7 @@ impl Store {
         Ok(seq)
     }
 
+    /// 任务快照与对应事件一起提交，确保查询结果和流式事件保持一致。
     pub async fn save_event(&self, task: &Task, event: &StreamResponse) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
         let seq = save(&mut tx, task, event).await?;
@@ -222,6 +229,7 @@ impl Store {
         )
     }
 
+    /// 在同一读取事务中获取任务及事件游标，避免两次读取之间产生事件遗漏或重复。
     pub async fn snapshot(&self, task_id: &str) -> Result<Option<(Task, i64)>> {
         let mut tx = self.pool.begin().await?;
         let body: Option<String> = sqlx::query_scalar("SELECT body FROM tasks WHERE id=?")
@@ -243,6 +251,7 @@ impl Store {
     }
 }
 
+// '_ 让编译器推断事务借用的生命周期；&mut **tx 将借用解引用到 SQL 执行器。
 async fn save(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     task: &Task,
@@ -265,6 +274,7 @@ async fn save(
     )
 }
 
+/// 懒创建 metadata，并返回它的可变借用；调用者直接修改任务中原来的映射。
 pub fn metadata(task: &mut Task) -> &mut std::collections::HashMap<String, Value> {
     task.metadata.get_or_insert_with(Default::default)
 }

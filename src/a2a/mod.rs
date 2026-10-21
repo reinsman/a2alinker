@@ -1,3 +1,6 @@
+//! HTTP 协议边界：Agent Card、认证、JSON-RPC 参数检查，以及 SSE 流式响应。
+//! 具体执行交给 Gateway，网络连接的生命周期与 agent 任务的生命周期分开管理。
+
 use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -33,6 +36,7 @@ struct App {
     token_hash: Option<[u8; 32]>,
 }
 
+/// 构建共享同一网关的路由；App 的 Clone 只克隆 Arc 等轻量句柄。
 pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
     let token_hash = if gateway.config.auth.mode == AuthMode::Bearer {
         let token = std::env::var(&gateway.config.auth.token_env)
@@ -107,6 +111,7 @@ async fn card(State(app): State<App>) -> Response {
     response
 }
 
+// State 是 Axum 的提取器：框架从路由共享状态中取出 App，并解析请求头和请求体。
 async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Response {
     if !authorized(&headers, app.token_hash.as_ref()) {
         let mut response = (
@@ -119,7 +124,7 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         return response;
     }
-    // JSON requests cannot be sent as a browser's cross-origin simple form submission.
+    // 限定 JSON 内容类型，阻止浏览器以跨域简单表单请求直接提交 RPC。
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -183,6 +188,8 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
     }
 }
 
+// 当前是实例共享 bearer token 认证，没有用户身份、角色或任务所有权层面的 RBAC。
+// 比较固定长度摘要，使用常量时间比较接口，避免普通字符串比较的提前退出行为。
 fn authorized(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -392,6 +399,7 @@ async fn dispatch(
     }
 }
 
+// 响应流被丢弃只会结束订阅；真正的任务由 Gateway 和 worker 持有，继续执行。
 async fn stream(
     gateway: Arc<Gateway>,
     id: Value,
@@ -412,8 +420,8 @@ async fn stream(
             .await
             .map_err(|_| ApiError::invalid("Last-Event-ID does not belong to this task"))?;
     }
-    // A2A subscriptions always start with the current Task. Reconnection replaces the
-    // client's previous snapshot rather than replaying deltas already present in it.
+    // 订阅首先发送当前 Task 快照。重连时客户端用它替换旧快照，
+    // 然后只接收后续事件，避免重放快照中已包含的文本增量。
     let (mut task, mut after) = gateway
         .store
         .snapshot(&task_id)
@@ -421,6 +429,7 @@ async fn stream(
         .ok_or_else(ApiError::not_found)?;
     trim_history(&mut task, history);
     let initial_terminal = task.status.state.is_terminal();
+    // yield 每次产生一条 SSE；数据库是事件来源，广播通知用于减少轮询延迟。
     let output = async_stream::stream! {
         yield Ok::<Event, Infallible>(sse_event(&id, &task_id, after, StreamResponse::Task(task)));
         if initial_terminal { return; }
@@ -463,6 +472,7 @@ fn has_interaction_extension(headers: &HeaderMap) -> bool {
         .and_then(|s| s.to_str().ok())
         .is_some_and(|s| s.split(',').any(|s| s.trim() == INTERACTION_EXTENSION))
 }
+// 泛型 T 表示目标请求类型；DeserializeOwned 要求反序列化结果自行拥有数据。
 fn parse<T: DeserializeOwned>(params: Value) -> ApiResult<T> {
     serde_json::from_value(params).map_err(|e| ApiError::invalid(e.to_string()))
 }

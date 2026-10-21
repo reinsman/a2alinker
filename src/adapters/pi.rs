@@ -1,3 +1,5 @@
+//! pi 的 RPC 适配器：会话以 JSONL 文件保存，事件通过标准输入/输出传输。
+
 use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
@@ -20,6 +22,7 @@ pub struct PiSession {
 }
 
 impl PiSession {
+    /// 创建/恢复会话并验证技能；此方法只握手，不向模型发送 prompt。
     pub async fn start(
         context: &AdapterContext,
         context_id: &str,
@@ -27,6 +30,7 @@ impl PiSession {
     ) -> Result<Self> {
         let session_dir = context.config.storage.directory.join("sessions");
         std::fs::create_dir_all(&session_dir)?;
+        // 外部 contextId 先哈希成文件名，避免客户端通过 ../ 等内容控制会话文件路径。
         let path = native.map(std::path::PathBuf::from).unwrap_or_else(|| {
             session_dir.join(format!("{:x}.jsonl", Sha256::digest(context_id.as_bytes())))
         });
@@ -105,6 +109,7 @@ impl AgentSession for PiSession {
         mut replies: mpsc::Receiver<InteractionReply>,
         cancel: CancellationToken,
     ) -> Result<RunOutcome> {
+        // prompt 的响应只表示命令被接受；必须继续消费事件才能知道任务何时结束。
         self.process
             .request("prompt", json!({"message": prompt}), true)
             .await?;
@@ -156,12 +161,13 @@ impl AgentSession for PiSession {
                         "tool_execution_start" => {
                             events.send(AgentEvent::Progress(format!("Running tool: {}", record["toolName"].as_str().unwrap_or("tool")))).await?;
                         }
+                        // 等待包括自动重试在内的整轮工作结束，不能把中间 agent_end 当终态。
                         "agent_settled" => {
                             if cancelling || record["aborted"] == true { return Ok(RunOutcome::Canceled); }
                             if let Some(error) = last_error { bail!("{error}"); }
                             return Ok(RunOutcome::Completed);
                         }
-                        // Older releases have no session-level settled event or willRetry discriminator.
+                        // 兼容旧版：没有 settled 事件且不带 willRetry 标记时，agent_end 即结束。
                         "agent_end" if record.get("willRetry").is_none() => {
                             if cancelling { return Ok(RunOutcome::Canceled); }
                             if let Some(error) = last_error { bail!("{error}"); }
