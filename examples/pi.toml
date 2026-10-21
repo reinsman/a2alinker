@@ -15,6 +15,7 @@ native_config = "./agents/pi/settings.json"
 inherit_auth = true
 allow_extensions = false
 # executable = "/absolute/path/to/pi"
+# 如果 pi 依赖 nvm，使用 pi-nvm.toml，或将 executable 设为 "../scripts/pi-nvm"。
 # provider = "your-provider"
 # model = "your-model"
 

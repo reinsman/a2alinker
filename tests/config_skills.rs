@@ -157,7 +157,7 @@ fn symlinks_inside_skill_packages_are_rejected() {
 #[test]
 fn bundled_examples_validate_and_have_loadable_skills() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for example in ["pi.toml", "codex.toml"] {
+    for example in ["pi.toml", "pi-nvm.toml", "codex.toml"] {
         let cfg = Config::load(Some(&root.join("examples").join(example))).unwrap();
         cfg.validate().unwrap();
         assert_eq!(SkillSet::discover(&cfg).unwrap().skills.len(), 1);

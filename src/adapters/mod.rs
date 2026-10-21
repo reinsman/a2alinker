@@ -156,7 +156,12 @@ pub async fn probe(config: &Config) -> Result<String> {
     )
     .await
     .context("agent version probe timed out")?
-    .context("cannot start agent executable")?;
+    .with_context(|| {
+        format!(
+            "cannot start agent executable '{}'; check agent.executable, agent.env.PATH and the script interpreter (nvm setup: docs/agent-launch.md)",
+            config.executable().display()
+        )
+    })?;
     ensure!(
         output.status.success(),
         "agent --version exited unsuccessfully"

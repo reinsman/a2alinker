@@ -41,6 +41,8 @@ a2alinker serve \
 
 `agents list` 查看内置适配器，`skills list --config ...` 列出实际选中的技能包。
 
+若 pi 需要先执行 `nvm use` 才能找到，可使用 `doctor --config examples/pi-nvm.toml` 或 `serve --config examples/pi-nvm.toml`，通过配置自动选择 Node.js 版本。启动脚本、PATH 设置与错误排查见 [agent 启动环境](docs/agent-launch.md)。
+
 ## 配置
 
 完整示例见 [pi.toml](examples/pi.toml) 和 [codex.toml](examples/codex.toml)。

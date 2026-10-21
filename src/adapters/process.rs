@@ -58,7 +58,12 @@ impl JsonlProcess {
         #[cfg(unix)]
         // 0 表示为新子进程建立以其 PID 为 ID 的进程组，便于连同工具进程一起清理。
         cmd.process_group(0);
-        let mut child = cmd.spawn().context("spawn agent process")?;
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "cannot spawn agent executable '{}'; check agent.executable, agent.env.PATH and the script interpreter (nvm setup: docs/agent-launch.md)",
+                context.config.executable().display()
+            )
+        })?;
         let group_id = child.id();
         // 前面已将三个管道设置为 piped，启动成功后这些 Option 必然为 Some。
         // take() 取出管道所有权并把原字段置为 None，之后由本对象或读取任务持有。
