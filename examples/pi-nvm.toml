@@ -11,7 +11,8 @@ description = "Review code with pi and a selected skill package."
 [agent]
 kind = "pi"
 workspace = ".."
-# 省略 native_config 时自动读取 PI_CODING_AGENT_DIR/settings.json 或 ~/.pi/agent/settings.json。
+# 省略 native_config 会自动读取用户 settings.json 及同目录 models.json，并非不加载配置。
+# 默认目录：PI_CODING_AGENT_DIR，未设置时为 ~/.pi/agent。
 # native_config = "~/custom-pi/settings.json"
 inherit_auth = true
 allow_extensions = false

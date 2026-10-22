@@ -150,6 +150,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 "Native configuration: {}",
                 native_configuration_label(&config)?
             );
+            if let Some(path) = config.native_model_config()? {
+                println!("Native model configuration: {}", path.display());
+            }
             // 临时目录拥有自己的生命周期；离开此分支时会自动删除，不使用正式存储。
             let temp = tempfile::tempdir()?;
             config.storage.directory = temp.path().into();
@@ -188,6 +191,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 native_configuration_label(&config)?,
                 skills.skills.len()
             );
+            if let Some(path) = config.native_model_config()? {
+                println!("Native model configuration: {}", path.display());
+            }
             Ok(())
         }
         Command::Agents {

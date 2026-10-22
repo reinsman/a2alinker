@@ -118,6 +118,10 @@ pub fn prepare_home(config: &Config, skill_digest: &str) -> Result<PathBuf> {
             std::fs::copy(&source, home.join(filename)).context("copy native configuration")?;
         }
     }
+    // settings.json 只保存模型选择；自定义 provider 的端点、API 和 key 在 models.json。
+    if let Some(source) = config.native_model_config()? {
+        std::fs::copy(source, home.join("models.json")).context("copy pi model configuration")?;
+    }
     if config.agent.inherit_auth && !home.join("auth.json").exists() {
         // 配置与登录文件使用同一套来源规则，避免指定 PI_CODING_AGENT_DIR 后混用其他账号。
         let source = config.user_agent_directory()?;
@@ -128,7 +132,7 @@ pub fn prepare_home(config: &Config, skill_digest: &str) -> Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for name in ["auth.json", "config.toml", "settings.json"] {
+        for name in ["auth.json", "config.toml", "settings.json", "models.json"] {
             let path = home.join(name);
             if path.exists() {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

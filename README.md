@@ -52,6 +52,7 @@ a2alinker serve \
 - 重复的 `--skill-dir` 会替换配置文件中的目录列表；环境变量 `A2ALINKER_SKILL_DIRS` 使用分号分隔目录。
 - `--agent-config` 对 Codex 可以是 `config.toml` 或专用配置目录，对 pi 可以是 `settings.json` 或专用配置目录。
 - pi 省略 `agent.native_config` 时，自动读取 `PI_CODING_AGENT_DIR/settings.json`，未设置该变量则读取 `~/.pi/agent/settings.json`；`agent.env` 中的来源环境变量优先于网关进程环境。默认文件不存在时使用 pi 内置默认值，显式指定的文件不存在则报错。`doctor` 和 `config validate` 会显示实际配置来源。
+- pi 会同时复制来源目录中的 `models.json`，保留自定义 provider 的模型、端点和 API 配置；它也参与执行指纹，副本权限为 `0600`。指定单个 settings 文件时使用其同目录的 models 文件，指定完整配置目录时一并复制。
 - 原生配置复制到实例私有运行目录；配置内容或选中技能变化后，已有 context 不会静默换用新配置，需要新建 context。
 - `agent.env` 可以配置子进程环境变量；推荐由部署环境注入密钥。服务不会自动读取 `.env`。
 - `agent.inherit_auth = true` 会在私有运行目录尚无 `auth.json` 时复制当前 agent 的登录文件。不会复制用户的全部配置，也不会写回原始登录文件。API key 也可以使用 agent 原生环境配置。更换账号时应使用新的 storage 目录或停服后清理对应私有凭据。
@@ -125,6 +126,7 @@ SSE 断开不会取消任务。重新调用 `SubscribeToTask` 会用当前 Task 
 - 取消先发送原生中断；超时会释放会话并清理进程组。子进程退出、非法 JSONL 和输出超限会使任务失败，释放执行槽位。
 - 默认任务超时 1800 秒、取消宽限 5 秒、启动握手超时 30 秒。等待用户交互的时间计入任务超时。
 - SQLite 保存任务、消息去重、事件与底层会话标识；空闲会话释放进程，后续通过原生会话恢复。
+- pi 会话文件位于 `storage.directory/sessions/`，一个 context 对应一个 JSONL 文件；同一会话的多轮任务共用该文件。pi 通常在首次 assistant 消息后才写入新文件，启动预检与 `doctor` 不会生成完整对话记录。
 - 网关重启会将未结束的任务标记失败，不会自动重跑可能产生副作用的操作。已完成任务、去重记录和可恢复的 context 保留。
 - skill 副本与 agent 私有配置均保存在 storage 中；生产部署应持久化整个目录。
 

@@ -264,6 +264,7 @@ impl Config {
                 p.display()
             );
         }
+        self.native_model_config()?;
         for p in &self.skills.directories {
             ensure!(
                 p.is_dir(),
@@ -398,6 +399,34 @@ impl Config {
         Ok(None)
     }
 
+    /// pi 的自定义 provider/模型定义。单文件配置同时携带其同目录的 models.json；
+    /// 省略配置时读取用户默认目录，显式目录则已由完整目录复制流程处理。
+    pub fn native_model_config(&self) -> Result<Option<PathBuf>> {
+        if self.agent.kind != AgentKind::Pi {
+            return Ok(None);
+        }
+        let directory = match &self.agent.native_config {
+            Some(path) if path.is_dir() => return Ok(None),
+            Some(path) => path.parent().map(Path::to_path_buf),
+            None => self.user_agent_directory()?,
+        };
+        if let Some(directory) = directory {
+            let path = directory.join("models.json");
+            if path
+                .try_exists()
+                .with_context(|| format!("check pi model configuration {}", path.display()))?
+            {
+                ensure!(
+                    path.is_file(),
+                    "pi model configuration is not a file: {}",
+                    path.display()
+                );
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn public_url(&self) -> String {
         self.server
             .public_url
@@ -447,6 +476,12 @@ impl Config {
                     }
                 }
             }
+        }
+        // 模型端点、API 类型或凭据变化后也要隔离旧会话，且不在日志中暴露这些内容。
+        if let Some(path) = self.native_model_config()? {
+            digest.update(b"pi-models\0");
+            digest.update(serde_json::to_vec(&path)?);
+            digest.update(std::fs::read(path)?);
         }
         Ok(format!("{:x}", digest.finalize()))
     }

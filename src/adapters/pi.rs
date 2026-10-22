@@ -34,6 +34,7 @@ impl PiSession {
         let path = native.map(std::path::PathBuf::from).unwrap_or_else(|| {
             session_dir.join(format!("{:x}.jsonl", Sha256::digest(context_id.as_bytes())))
         });
+        // 只有恢复已有会话才要求文件存在；pi 通常在首次 assistant 消息后才将新会话写盘。
         if native.is_some() {
             ensure!(
                 path.is_file(),
@@ -64,6 +65,14 @@ impl PiSession {
         args.extend(context.config.agent.args.clone());
         let mut process = JsonlProcess::spawn(context, &args)?;
         let state = process.request("get_state", json!({}), true).await?;
+        // 只记录选择的模型标识，不输出可能含端点、请求头等信息的完整 model 对象。
+        if let Some(model) = state.get("model").filter(|value| value.is_object()) {
+            tracing::info!(
+                provider = model["provider"].as_str().unwrap_or("unknown"),
+                model = model["id"].as_str().unwrap_or("unknown"),
+                "pi model selected"
+            );
+        }
         if !context.skills.skills.is_empty() {
             let commands = process.request("get_commands", json!({}), true).await?;
             for skill in &context.skills.skills {

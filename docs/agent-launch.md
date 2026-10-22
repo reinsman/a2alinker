@@ -66,7 +66,19 @@ native_config = "~/.pi/agent/settings.json"
 
 运行 `config validate --config examples/pi-nvm.toml` 或 `doctor --config examples/pi-nvm.toml`，输出的 `Native configuration` 会显示实际来源。默认配置复制到实例私有目录后再由 pi 读取，原文件不被修改。配置内容变化会更新执行指纹；重启后需新建 context 使用新配置。
 
-自动继承的是全局 `settings.json`，登录文件由 `inherit_auth` 控制。若还需自定义 provider 的 `models.json` 等配套文件，可以将 `native_config` 显式指定为包含这些文件的专用配置目录。技能和扩展加载仍由 a2alinker 对应配置控制。
+自动继承全局 `settings.json` 和同目录的 `models.json`（如果存在）；后者保存自定义 provider 的端点、API、模型定义等。即使默认 settings 文件不存在，也会继承 models 文件。显式指定单个 settings 文件时会携带其同目录的 models 文件；如需其他配套文件，可显式指定专用配置目录。登录文件由 `inherit_auth` 控制，技能和扩展加载仍由 a2alinker 对应配置控制。
+
+`models.json` 可能含密钥，其副本权限为 `0600`，内容不会打印到日志。它的内容变化也会更新执行指纹。`doctor` 和 `config validate` 会显示 `Native model configuration` 来源，pi 握手日志会显示实际选中的 provider 和模型名称。
+
+## 会话文件与 forbidden 的排查
+
+`data/pi-reviewer/sessions/` 中只有一个 JSONL 文件，不代表会话丢失。一个 context 对应一个文件，后续任务带同一 contextId 就会复用它。pi 通常在首次 assistant 消息后才写入新会话文件；启动预检和 doctor 不会生成完整对话记录。要保留历史会话，应持久化整个 storage 目录，不能只保留数据库。
+
+如果 curl 返回 HTTP 200，但 Task 状态是 `TASK_STATE_FAILED`，状态消息含 `403 forbidden`，说明请求已到达网关，模型服务拒绝了后续请求。先检查 pi 握手日志中的 provider/model 是否符合预期，以及 models 配置是否加载；若选择正确但仍被拒绝，需要检查该模型服务的凭据、账号权限和请求策略。网关 bearer 认证失败会直接返回 HTTP 401。
+
+例如上游返回 `permission_denied / plan_model_not_allowed`，并提示 `this project's plan is not authorized for this model`，表示该项目套餐没有所选模型的调用权限。应选择账号允许的模型，或在模型服务端处理授权；修改网关 bearer 配置无法解决。`doctor` 只验证原生握手、技能加载和模型选择，不发送模型请求，因此不能验证远端套餐权限。
+
+更新配置或二进制后应重启正在运行的进程；已经启动的进程不会自动读取新代码。配置来源或 models 内容变化后需使用新的 context。保留原 task 查询历史；修改消息内容时应使用新的 messageId，避免去重机制返回原来的失败任务。
 
 ## 直接配置绝对路径与 PATH
 

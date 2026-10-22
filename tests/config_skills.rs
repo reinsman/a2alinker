@@ -290,6 +290,94 @@ fn symlinks_inside_skill_packages_are_rejected() {
 }
 
 #[test]
+fn pi_default_models_are_copied_hashed_and_keep_private_permissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pi-user");
+    std::fs::create_dir(&source).unwrap();
+    let models = source.join("models.json");
+    let first =
+        r#"{"providers":{"example":{"baseUrl":"https://first.invalid","apiKey":"test-token"}}}"#;
+    std::fs::write(&models, first).unwrap();
+    let mut cfg = config(temp.path());
+    cfg.agent.kind = AgentKind::Pi;
+    cfg.agent.inherit_auth = false;
+    cfg.agent
+        .env
+        .insert("PI_CODING_AGENT_DIR".into(), source.display().to_string());
+    // 没有 settings.json 时，也要继承用户定义的模型列表。
+    assert!(cfg.effective_native_config().unwrap().is_none());
+    assert_eq!(cfg.native_model_config().unwrap(), Some(models.clone()));
+    let digest = cfg.fingerprint("").unwrap();
+    let home = adapters::prepare_home(&cfg, "").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.join("models.json")).unwrap(),
+        first
+    );
+    assert_eq!(std::fs::read_to_string(&models).unwrap(), first);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(home.join("models.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    std::fs::write(&models, first.replace("first.invalid", "second.invalid")).unwrap();
+    assert_ne!(digest, cfg.fingerprint("").unwrap());
+    let changed = adapters::prepare_home(&cfg, "").unwrap();
+    assert_ne!(home, changed);
+    assert_eq!(
+        std::fs::read_to_string(home.join("models.json")).unwrap(),
+        first
+    );
+}
+
+#[test]
+fn pi_explicit_file_and_directory_configs_include_their_models() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("dedicated-pi");
+    std::fs::create_dir(&source).unwrap();
+    let settings = source.join("settings.json");
+    let models = source.join("models.json");
+    std::fs::write(&settings, r#"{"defaultProvider":"example"}"#).unwrap();
+    std::fs::write(&models, r#"{"providers":{"example":{}}}"#).unwrap();
+    let mut cfg = config(temp.path());
+    cfg.agent.kind = AgentKind::Pi;
+    cfg.agent.inherit_auth = false;
+    cfg.agent.native_config = Some(settings);
+    assert_eq!(cfg.native_model_config().unwrap(), Some(models.clone()));
+    let home = adapters::prepare_home(&cfg, "").unwrap();
+    assert_eq!(
+        std::fs::read(home.join("models.json")).unwrap(),
+        std::fs::read(&models).unwrap()
+    );
+    cfg.agent.native_config = Some(source);
+    assert!(cfg.native_model_config().unwrap().is_none());
+    let home = adapters::prepare_home(&cfg, "").unwrap();
+    assert_eq!(
+        std::fs::read(home.join("models.json")).unwrap(),
+        std::fs::read(models).unwrap()
+    );
+}
+
+#[test]
+fn pi_rejects_a_directory_in_place_of_models_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("pi-user");
+    std::fs::create_dir_all(source.join("models.json")).unwrap();
+    let mut cfg = config(temp.path());
+    cfg.agent.kind = AgentKind::Pi;
+    cfg.agent
+        .env
+        .insert("PI_CODING_AGENT_DIR".into(), source.display().to_string());
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
 fn bundled_examples_validate_and_have_loadable_skills() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for example in ["pi.toml", "pi-nvm.toml", "codex.toml"] {
