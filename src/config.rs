@@ -84,6 +84,7 @@ impl Default for IdentityConfig {
 pub struct AgentConfig {
     pub kind: AgentKind,
     pub executable: Option<PathBuf>,
+    /// 显式覆盖原生配置；pi 未填写时会自动查找用户默认 settings.json。
     pub native_config: Option<PathBuf>,
     pub workspace: PathBuf,
     pub model: Option<String>,
@@ -256,7 +257,7 @@ impl Config {
             "workspace is not a directory: {}",
             self.agent.workspace.display()
         );
-        if let Some(p) = &self.agent.native_config {
+        if let Some(p) = self.effective_native_config()? {
             ensure!(
                 p.exists(),
                 "native configuration does not exist: {}",
@@ -350,6 +351,53 @@ impl Config {
             .unwrap_or_else(|| self.agent.kind.as_str().into())
     }
 
+    /// 原始用户配置目录。先取 agent.env 中的覆盖项，再取启动网关时的环境变量。
+    /// agent 真正启动时会使用实例私有目录，这里保留的是复制配置和凭据的来源。
+    pub fn user_agent_directory(&self) -> Result<Option<PathBuf>> {
+        let env = |key: &str| {
+            self.agent
+                .env
+                .get(key)
+                .map(std::ffi::OsString::from)
+                .or_else(|| std::env::var_os(key))
+                .filter(|value| !value.is_empty())
+        };
+        let (key, fallback) = match self.agent.kind {
+            AgentKind::Pi => ("PI_CODING_AGENT_DIR", ".pi/agent"),
+            AgentKind::Codex => ("CODEX_HOME", ".codex"),
+        };
+        env(key)
+            .map(PathBuf::from)
+            .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(fallback)))
+            .map(|directory| absolute(&directory, &self.agent.workspace))
+            .transpose()
+    }
+
+    /// 显式 native_config 优先；pi 省略时读取用户 settings.json，文件不存在则用内置默认值。
+    /// 不修改配置字段，确保 CLI 在覆盖 agent 类型后仍能选到正确的默认文件。
+    pub fn effective_native_config(&self) -> Result<Option<PathBuf>> {
+        if let Some(path) = &self.agent.native_config {
+            return Ok(Some(path.clone()));
+        }
+        if self.agent.kind == AgentKind::Pi
+            && let Some(directory) = self.user_agent_directory()?
+        {
+            let path = directory.join("settings.json");
+            if path
+                .try_exists()
+                .with_context(|| format!("check default pi configuration {}", path.display()))?
+            {
+                ensure!(
+                    path.is_file(),
+                    "default pi configuration is not a file: {}",
+                    path.display()
+                );
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn public_url(&self) -> String {
         self.server
             .public_url
@@ -365,12 +413,16 @@ impl Config {
         let content = serde_json::to_vec(&(&self.agent, &self.skills, skill_digest))?;
         let mut digest = Sha256::new();
         digest.update(content);
-        if let Some(path) = &self.agent.native_config {
+        if let Some(path) = self.effective_native_config()? {
+            // 自动发现的路径不在 agent.native_config 字段中，也需要纳入执行指纹。
+            if self.agent.native_config.is_none() {
+                digest.update(serde_json::to_vec(&path)?);
+            }
             if path.is_file() {
                 digest.update(std::fs::read(path)?);
             } else {
                 let mut total = 0u64;
-                for entry in walkdir::WalkDir::new(path).sort_by_file_name() {
+                for entry in walkdir::WalkDir::new(&path).sort_by_file_name() {
                     let entry = entry?;
                     ensure!(
                         !entry.file_type().is_symlink(),
@@ -385,7 +437,7 @@ impl Config {
                         digest.update(
                             entry
                                 .path()
-                                .strip_prefix(path)?
+                                .strip_prefix(&path)?
                                 .to_string_lossy()
                                 .as_bytes(),
                         );

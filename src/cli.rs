@@ -146,6 +146,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let mut config = args.resolve()?;
             let version = adapters::probe(&config).await?;
             println!("Executable: {version}");
+            println!(
+                "Native configuration: {}",
+                native_configuration_label(&config)?
+            );
             // 临时目录拥有自己的生命周期；离开此分支时会自动删除，不使用正式存储。
             let temp = tempfile::tempdir()?;
             config.storage.directory = temp.path().into();
@@ -178,9 +182,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let config = args.resolve()?;
             let skills = SkillSet::discover(&config)?;
             println!(
-                "Configuration: OK\nAgent: {}\nWorkspace: {}\nSelected skills: {}",
+                "Configuration: OK\nAgent: {}\nWorkspace: {}\nNative configuration: {}\nSelected skills: {}",
                 config.agent.kind.as_str(),
                 config.agent.workspace.display(),
+                native_configuration_label(&config)?,
                 skills.skills.len()
             );
             Ok(())
@@ -201,6 +206,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// 只显示配置来源路径，不输出配置内容，便于确认当前使用的是哪个原生文件。
+fn native_configuration_label(config: &Config) -> Result<String> {
+    Ok(config
+        .effective_native_config()?
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "agent built-in defaults".into()))
 }
 
 /// 绑定端口、预检 agent，再运行 HTTP；收到退出信号后等待任务清理完成。

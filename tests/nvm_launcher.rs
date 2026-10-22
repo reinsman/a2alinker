@@ -46,6 +46,10 @@ nvm() {
     cfg.agent.executable = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/pi-nvm"));
     cfg.agent.workspace = root.into();
     cfg.agent.inherit_auth = false;
+    cfg.agent.env.insert(
+        "PI_CODING_AGENT_DIR".into(),
+        root.join("user-pi").display().to_string(),
+    );
     // 不修改测试进程的全局环境，避免与并发测试互相影响。
     cfg.agent.env.insert("PATH".into(), "/usr/bin:/bin".into());
     cfg.agent

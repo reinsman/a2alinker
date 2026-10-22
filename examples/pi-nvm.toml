@@ -11,7 +11,8 @@ description = "Review code with pi and a selected skill package."
 [agent]
 kind = "pi"
 workspace = ".."
-native_config = "./agents/pi/settings.json"
+# 省略 native_config 时自动读取 PI_CODING_AGENT_DIR/settings.json 或 ~/.pi/agent/settings.json。
+# native_config = "~/custom-pi/settings.json"
 inherit_auth = true
 allow_extensions = false
 # 相对于本配置文件解析；脚本自动初始化 nvm 并选择下面指定的 Node.js。

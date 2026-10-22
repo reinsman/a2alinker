@@ -44,6 +44,30 @@ A2ALINKER_NODE_VERSION = "24.20.0"
 
 `doctor` 的版本探测、协议握手以及 `serve` 创建的会话都会使用同一个启动脚本。它不需要先在终端执行 `nvm use`。修改启动程序或 `agent.env` 后，执行指纹会变化，已有 context 需要重新创建。
 
+## 使用 pi 的默认配置文件
+
+`pi.toml` 和 `pi-nvm.toml` 默认不再指定仓库里的空 `settings.json`。省略 `agent.native_config` 时，自动使用：
+
+1. `PI_CODING_AGENT_DIR/settings.json`，如果设置了该环境变量。
+2. 否则使用 `$HOME/.pi/agent/settings.json`。
+
+`agent.env` 中的环境变量覆盖项优先于启动网关的环境变量；相对配置目录以 agent 的 workspace 为基准。默认文件不存在时使用 pi 内置默认值。
+
+如需固定到某个文件，仍可显式填写：
+
+```toml
+[agent]
+kind = "pi"
+workspace = ".."
+native_config = "~/.pi/agent/settings.json"
+```
+
+显式路径优先于自动发现，文件不存在会报错。`native_config` 支持展开 `~/`；`agent.env` 中的普通字符串不会做 shell 展开。也可以显式指向仓库中的空文件，以选择不继承用户设置。
+
+运行 `config validate --config examples/pi-nvm.toml` 或 `doctor --config examples/pi-nvm.toml`，输出的 `Native configuration` 会显示实际来源。默认配置复制到实例私有目录后再由 pi 读取，原文件不被修改。配置内容变化会更新执行指纹；重启后需新建 context 使用新配置。
+
+自动继承的是全局 `settings.json`，登录文件由 `inherit_auth` 控制。若还需自定义 provider 的 `models.json` 等配套文件，可以将 `native_config` 显式指定为包含这些文件的专用配置目录。技能和扩展加载仍由 a2alinker 对应配置控制。
+
 ## 直接配置绝对路径与 PATH
 
 不使用脚本时，也可以同时指定 pi 路径和包含正确 node 的 PATH，例如：

@@ -103,30 +103,24 @@ pub fn prepare_home(config: &Config, skill_digest: &str) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
     }
-    if let Some(source) = &config.agent.native_config {
+    if let Some(source) = config.effective_native_config()? {
         if source.is_dir() {
             ensure!(
                 !home.canonicalize()?.starts_with(source.canonicalize()?),
                 "runtime storage must be outside the native configuration directory"
             );
-            copy_directory(source, &home)?;
+            copy_directory(&source, &home)?;
         } else {
             let filename = match config.agent.kind {
                 AgentKind::Pi => "settings.json",
                 AgentKind::Codex => "config.toml",
             };
-            std::fs::copy(source, home.join(filename)).context("copy native configuration")?;
+            std::fs::copy(&source, home.join(filename)).context("copy native configuration")?;
         }
     }
     if config.agent.inherit_auth && !home.join("auth.json").exists() {
-        let source = match config.agent.kind {
-            AgentKind::Codex => std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex"))),
-            AgentKind::Pi => std::env::var_os("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".pi/agent"))),
-        };
+        // 配置与登录文件使用同一套来源规则，避免指定 PI_CODING_AGENT_DIR 后混用其他账号。
+        let source = config.user_agent_directory()?;
         if let Some(source) = source.map(|p| p.join("auth.json")).filter(|p| p.is_file()) {
             std::fs::copy(source, home.join("auth.json"))?;
         }

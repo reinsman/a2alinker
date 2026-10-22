@@ -51,6 +51,7 @@ a2alinker serve \
 - TOML 中的相对路径以配置文件所在目录为基准；命令行和环境变量中的路径以当前工作目录为基准。
 - 重复的 `--skill-dir` 会替换配置文件中的目录列表；环境变量 `A2ALINKER_SKILL_DIRS` 使用分号分隔目录。
 - `--agent-config` 对 Codex 可以是 `config.toml` 或专用配置目录，对 pi 可以是 `settings.json` 或专用配置目录。
+- pi 省略 `agent.native_config` 时，自动读取 `PI_CODING_AGENT_DIR/settings.json`，未设置该变量则读取 `~/.pi/agent/settings.json`；`agent.env` 中的来源环境变量优先于网关进程环境。默认文件不存在时使用 pi 内置默认值，显式指定的文件不存在则报错。`doctor` 和 `config validate` 会显示实际配置来源。
 - 原生配置复制到实例私有运行目录；配置内容或选中技能变化后，已有 context 不会静默换用新配置，需要新建 context。
 - `agent.env` 可以配置子进程环境变量；推荐由部署环境注入密钥。服务不会自动读取 `.env`。
 - `agent.inherit_auth = true` 会在私有运行目录尚无 `auth.json` 时复制当前 agent 的登录文件。不会复制用户的全部配置，也不会写回原始登录文件。API key 也可以使用 agent 原生环境配置。更换账号时应使用新的 storage 目录或停服后清理对应私有凭据。

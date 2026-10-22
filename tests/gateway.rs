@@ -37,6 +37,10 @@ fn config(temp: &TempDir, kind: AgentKind) -> Config {
     cfg.agent.executable = Some(fixture());
     cfg.agent.workspace = temp.path().into();
     cfg.agent.inherit_auth = false;
+    cfg.agent.env.insert(
+        "PI_CODING_AGENT_DIR".into(),
+        temp.path().join("user-pi").display().to_string(),
+    );
     cfg.storage.directory = temp.path().join("data");
     cfg.runtime.startup_timeout_seconds = 5;
     cfg.runtime.cancel_timeout_seconds = 1;
