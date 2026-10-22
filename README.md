@@ -80,25 +80,29 @@ a2alinker serve \
 curl http://127.0.0.1:8081/.well-known/agent-card.json
 ```
 
-流式执行：
+流式执行新消息（示例使用 `uuidgen` 每次生成新的请求 ID 和消息 ID）：
 
 ```bash
 curl -N http://127.0.0.1:8081/a2a \
   -H 'Content-Type: application/json' \
   -H 'A2A-Version: 1.0' \
-  -d '{
+  --data-binary @- <<JSON
+  {
     "jsonrpc": "2.0",
-    "id": "request-1",
+    "id": "$(uuidgen)",
     "method": "SendStreamingMessage",
     "params": {
       "message": {
-        "messageId": "message-1",
+        "messageId": "$(uuidgen)",
         "role": "ROLE_USER",
         "parts": [{"text": "Review this repository and summarize the main risks."}]
       }
     }
-  }'
+  }
+JSON
 ```
+
+外层 `id` 用于关联 JSON-RPC 请求与响应，`messageId` 用于本实现的持久化去重。每条新消息使用新 `messageId`；网络重试同一条消息时，应复用第一次生成的消息 ID 和消息内容。
 
 新任务接受 `text/plain` 文本。图片、URL 和二进制输入目前返回不支持错误，服务不会自动下载远程文件。
 
@@ -113,7 +117,7 @@ curl -N http://127.0.0.1:8081/a2a \
 
 使用响应中的 `contextId` 创建后续任务，复用底层 agent 会话。`taskId` 用于查询、取消或回复正在等待输入的任务。终态 task 不会重开。
 
-同一个 `messageId`、同一份消息内容重试会返回原任务；更改内容后复用该 ID 会报错。此规则包括审批回复，跨重启保留。
+同一个 `messageId`、同一份消息内容重试会返回原任务；更改内容后复用该 ID 会报错。此规则包括审批回复，跨重启保留。修复模型或凭据后，若希望重新执行失败任务，必须提交新的消息 ID；仅修改外层 JSON-RPC `id` 或重启服务，都不会重新执行旧消息。
 
 SSE 断开不会取消任务。重新调用 `SubscribeToTask` 会用当前 Task 快照恢复状态，然后接收后续事件。可以传入之前的 `Last-Event-ID` 进行游标归属校验；服务不会在最新快照后重放已经包含在快照里的旧增量。已经结束的任务使用 `GetTask` 查询。
 
