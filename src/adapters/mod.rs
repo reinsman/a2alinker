@@ -1,6 +1,7 @@
 //! 适配器的公共接口：runtime 只认识这些类型，不依赖 pi 或 Codex 的具体报文。
 
 mod codex;
+pub(crate) mod execution;
 mod pi;
 pub mod process;
 
@@ -15,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+pub use execution::{ToolEvent, ToolPhase};
 
 use crate::{
     config::{AgentKind, Config},
@@ -36,11 +39,25 @@ pub struct InteractionReply {
     pub response: Value,
 }
 
-/// 原生协议统一成四类事件；完整文本与增量文本分开，便于正确更新产物。
+/// 原生协议统一成回答、公开思考、工具过程、普通进度和交互事件。
+/// 完整文本与增量文本分开，便于正确更新产物。
 #[derive(Debug)]
 pub enum AgentEvent {
-    OutputDelta { item_id: String, text: String },
-    OutputComplete { item_id: String, text: String },
+    OutputDelta {
+        item_id: String,
+        text: String,
+    },
+    OutputComplete {
+        item_id: String,
+        text: String,
+    },
+    Reasoning {
+        item_id: String,
+        text: String,
+        append: bool,
+        last_chunk: bool,
+    },
+    Tool(ToolEvent),
     Progress(String),
     Interaction(Interaction),
 }
@@ -117,10 +134,12 @@ pub fn prepare_home(config: &Config, skill_digest: &str) -> Result<PathBuf> {
             };
             std::fs::copy(&source, home.join(filename)).context("copy native configuration")?;
         }
+        tracing::info!(event = "config.native", source = %source.display(), destination = %home.display(), "原生配置已复制到实例私有目录，不修改来源文件");
     }
     // settings.json 只保存模型选择；自定义 provider 的端点、API 和 key 在 models.json。
     if let Some(source) = config.native_model_config()? {
-        std::fs::copy(source, home.join("models.json")).context("copy pi model configuration")?;
+        std::fs::copy(&source, home.join("models.json")).context("copy pi model configuration")?;
+        tracing::info!(event = "config.models", source = %source.display(), "pi 自定义 provider/model 配置已复制；只显示来源路径，不显示密钥或文件内容");
     }
     if config.agent.inherit_auth && !home.join("auth.json").exists() {
         // 配置与登录文件使用同一套来源规则，避免指定 PI_CODING_AGENT_DIR 后混用其他账号。

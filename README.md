@@ -123,6 +123,12 @@ SSE 断开不会取消任务。重新调用 `SubscribeToTask` 会用当前 Task 
 
 审批与输入使用显式扩展，详见 [交互协议](docs/interaction.md)。普通聊天文本不会被解释成授权。
 
+pi 默认返回上游公开的思考文本，以及工具名、参数、执行中的输出和最终结果。
+思考使用独立的 `artifactUpdate`，工具过程使用 `statusUpdate` 中的结构化 `data`；
+客户端可按 `metadata.a2alinker.kind` 和 `data.a2alinker.type` 分类展示。
+`GetTask` 和重连快照也包含已保存的过程；字段、配置开关与客户端示例见
+[执行过程协议](docs/execution.md)。
+
 ## 执行与恢复
 
 - 每个实例只有一个执行槽位，避免同一工作目录并发写入；队列有容量限制，同一 context 只能有一个未结束任务。
@@ -153,6 +159,8 @@ token_env = "A2ALINKER_TOKEN"
 TLS 可由反向代理终止。代理应关闭 SSE 缓冲，并允许长连接。浏览器跨域访问默认未开启 CORS；Rein Console 可通过同源后端或开发代理连接 `/a2a`。
 
 `SIGINT`、`SIGTERM` 会停止接收任务，取消执行并持久化最终状态。日志写入 stderr，`RUST_LOG=a2alinker=debug` 可调整级别。agent stderr 持续消费但不转发，避免将原生输出中的凭据带入服务日志。
+
+默认 INFO 日志带中文流程说明，覆盖请求、去重、任务状态、会话复用、产物和 SSE 生命周期；DEBUG 增加事件游标及原生命令名称，不输出提示词或回复正文。新手可以按照 [日志阅读指南](docs/logging.md) 对照 curl 请求观察 A2A 的执行过程。
 
 ## 开发
 

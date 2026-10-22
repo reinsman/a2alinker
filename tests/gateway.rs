@@ -102,6 +102,282 @@ async fn both_adapters_complete_without_duplicating_streamed_text() {
 }
 
 #[tokio::test]
+async fn pi_execution_stream_preserves_reasoning_tools_arguments_results_and_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = config(&temp, AgentKind::Pi);
+    let g = Gateway::open(cfg.clone()).await.unwrap();
+    let router = a2a::router(g.clone()).unwrap();
+    let card = serde_json::to_value(a2a::agent_card(&g)).unwrap();
+    let extension = card["capabilities"]["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|extension| extension["uri"] == "urn:a2alinker:execution:v1")
+        .unwrap();
+    assert_eq!(extension["params"], json!({"reasoning":true,"tools":true}));
+    let request = Request::post("/a2a").header("Content-Type", "application/json")
+        .body(Body::from(json!({"jsonrpc":"2.0","id":"execution-stream","method":"SendStreamingMessage","params":prompt("execution")}).to_string())).unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.headers()["Content-Type"], "text/event-stream");
+    let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    for private in [
+        "SIGNATURE_MUST_NOT_BE_FORWARDED",
+        "TOOL_SECRET_MUST_BE_REDACTED",
+        "RESULT_SECRET_MUST_BE_REDACTED",
+    ] {
+        assert!(!body.contains(private));
+    }
+    let frames: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<Value>(data).unwrap()["result"].clone())
+        .collect();
+    for frame in &frames {
+        let _: StreamResponse = serde_json::from_value(frame.clone()).unwrap();
+    }
+    let id = frames[0]["task"]["id"].as_str().unwrap();
+    let task = g.task(id).await.unwrap();
+    assert_eq!(task.status.state, TaskState::Completed);
+    assert_eq!(
+        task.artifacts.len(),
+        3,
+        "no empty answer artifact for tool-only message"
+    );
+    assert_eq!(task.artifacts[0].parts[0].as_text(), Some("检查仓库结构。"));
+    assert_eq!(task.artifacts[1].parts[0].as_text(), Some("再查看文件。"));
+    assert_eq!(task.artifacts[2].parts[0].as_text(), Some("Hello 1"));
+    assert_eq!(
+        task.history.last().unwrap().text_content().unwrap(),
+        "Hello 1"
+    );
+    assert_eq!(
+        task.history.len(),
+        4,
+        "one user, two tool snapshots and one answer"
+    );
+
+    // 按 A2A append/lastChunk 语义组装客户端输出，验证最终块不会造成重复文本。
+    let mut artifacts = std::collections::HashMap::<String, String>::new();
+    for frame in &frames {
+        if let Some(snapshot) = frame["task"]["artifacts"].as_array() {
+            for artifact in snapshot {
+                artifacts.insert(
+                    artifact["artifactId"].as_str().unwrap().into(),
+                    artifact["parts"][0]["text"].as_str().unwrap().into(),
+                );
+            }
+        }
+        if let Some(update) = frame.get("artifactUpdate") {
+            let id = update["artifact"]["artifactId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let text = update["artifact"]["parts"][0]["text"].as_str().unwrap();
+            if update["append"] == true {
+                artifacts.entry(id).or_default().push_str(text);
+            } else {
+                artifacts.insert(id, text.into());
+            }
+            assert!(matches!(
+                update["artifact"]["metadata"]["a2alinker"]["kind"].as_str(),
+                Some("reasoning" | "answer")
+            ));
+        }
+    }
+    for artifact in &task.artifacts {
+        assert_eq!(
+            artifacts[artifact.artifact_id.as_str()],
+            artifact.parts[0].as_text().unwrap()
+        );
+    }
+
+    // 从数据库验证完整生命周期；首次 SSE 快照之前的事件也不会影响断言。
+    let events = g.store.events(id, 0).await.unwrap();
+    let records: Vec<Value> = events
+        .iter()
+        .filter_map(|(_, event)| {
+            let value = serde_json::to_value(event).unwrap();
+            value["statusUpdate"]["status"]["message"]["parts"]
+                .as_array()?
+                .iter()
+                .find_map(|part| {
+                    (part["data"]["a2alinker"]["kind"] == "tool")
+                        .then(|| part["data"]["a2alinker"].clone())
+                })
+        })
+        .collect();
+    assert_eq!(records.len(), 6);
+    assert_eq!(records[0]["type"], "tool_call");
+    assert_eq!(records[0]["arguments"]["command"], "ls -la");
+    assert_eq!(
+        records[0]["arguments"]["headers"]["Authorization"],
+        "[REDACTED]"
+    );
+    assert_eq!(records[2]["result"]["content"][0]["text"], "文件A\n");
+    assert_eq!(records[3]["result"]["content"][0]["text"], "文件A\n文件B\n");
+    assert_eq!(records[4]["toolCallId"], "call-read");
+    assert_eq!(records[4]["state"], "failed");
+    assert_eq!(records[4]["isError"], true);
+    assert_eq!(records[5]["toolCallId"], "call-bash");
+    assert_eq!(
+        records[5]["arguments"]["command"], "ls -la",
+        "end event preserves start arguments"
+    );
+    assert_eq!(records[5]["result"]["details"]["exitCode"], 0);
+    assert_eq!(records[5]["result"]["details"]["api_key"], "[REDACTED]");
+    let queried = rpc(&router, "GetTask", json!({"id":id})).await;
+    assert_eq!(queried["result"], serde_json::to_value(&task).unwrap());
+    g.shutdown().await;
+    drop(router);
+    drop(g);
+    let restarted = Gateway::open(cfg).await.unwrap();
+    assert_eq!(restarted.task(id).await.unwrap(), task);
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn pi_execution_forwarding_switches_filter_stream_and_storage_independently() {
+    for (reasoning, tools) in [(false, false), (false, true), (true, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = config(&temp, AgentKind::Pi);
+        cfg.runtime.forward_reasoning = reasoning;
+        cfg.runtime.forward_tools = tools;
+        let g = Gateway::open(cfg).await.unwrap();
+        let task = complete(&g, Message::user_text("execution")).await;
+        assert_eq!(task.status.state, TaskState::Completed);
+        assert_eq!(task.artifacts.len(), if reasoning { 3 } else { 1 });
+        assert_eq!(task.history.len(), if tools { 4 } else { 2 });
+        let events =
+            serde_json::to_string(&g.store.events(task.id.as_str(), 0).await.unwrap()).unwrap();
+        assert_eq!(events.contains("检查仓库结构"), reasoning);
+        assert_eq!(events.contains("toolCallId"), tools);
+        assert!(!events.contains("SIGNATURE_MUST_NOT_BE_FORWARDED"));
+        g.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn pi_running_tool_snapshot_survives_sse_reconnect_and_disconnect() {
+    let temp = tempfile::tempdir().unwrap();
+    let g = gateway(&temp, AgentKind::Pi).await;
+    let task = g
+        .submit(Message::user_text("execution-pause"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = serde_json::to_value(g.task(task.id.as_str()).await.unwrap()).unwrap();
+            if snapshot["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["parts"].as_array().unwrap().iter().any(|part| {
+                        part["data"]["a2alinker"]["result"]["content"][0]["text"]
+                            == "文件A\n文件B\n"
+                    })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let router = a2a::router(g.clone()).unwrap();
+    let response = router.oneshot(Request::post("/a2a").header("Content-Type", "application/json")
+        .body(Body::from(json!({"jsonrpc":"2.0","id":"reconnect","method":"SubscribeToTask","params":{"id":task.id}}).to_string())).unwrap()).await.unwrap();
+    let mut body = response.into_body();
+    let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let text = std::str::from_utf8(frame.data_ref().unwrap()).unwrap();
+    let snapshot: Value = serde_json::from_str(
+        text.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot["result"]["task"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+    assert_eq!(
+        snapshot["result"]["task"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let history = snapshot["result"]["task"]["history"].as_array().unwrap();
+    let records: Vec<&Value> = history
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .filter_map(|part| part.get("data"))
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["a2alinker"]["toolCallId"], "call-bash");
+    assert_eq!(records[0]["a2alinker"]["arguments"]["command"], "ls -la");
+    assert_eq!(
+        records[0]["a2alinker"]["result"]["content"][0]["text"],
+        "文件A\n文件B\n"
+    );
+    drop(body);
+    assert_eq!(
+        g.task(task.id.as_str()).await.unwrap().status.state,
+        TaskState::Working
+    );
+    assert_eq!(
+        g.cancel(task.id.as_str()).await.unwrap().status.state,
+        TaskState::Canceled
+    );
+    g.shutdown().await;
+}
+
+#[tokio::test]
+async fn pi_execution_content_counts_toward_output_limit_and_releases_session() {
+    for prompt in ["reasoning-large", "arguments-large", "tool-large"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = config(&temp, AgentKind::Pi);
+        cfg.runtime.max_output_bytes = 1024;
+        let g = Gateway::open(cfg).await.unwrap();
+        let failed = complete(&g, Message::user_text(prompt)).await;
+        assert_eq!(failed.status.state, TaskState::Failed, "{prompt}");
+        assert!(
+            failed
+                .status
+                .message
+                .as_ref()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("max_output_bytes")
+        );
+        let next = complete(
+            &g,
+            Message::user_text("hello").with_context_id(failed.context_id.as_str()),
+        )
+        .await;
+        assert_eq!(next.status.state, TaskState::Completed);
+        let persisted =
+            serde_json::to_string(&g.store.events(failed.id.as_str(), 0).await.unwrap()).unwrap();
+        assert!(
+            !persisted.contains(&"x".repeat(2048)),
+            "oversized event must not be persisted"
+        );
+        g.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn persistence_and_native_session_resume_survive_restart() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
         let temp = tempfile::tempdir().unwrap();

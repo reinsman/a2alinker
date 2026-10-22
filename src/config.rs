@@ -135,6 +135,10 @@ pub struct RuntimeConfig {
     pub cancel_timeout_seconds: u64,
     pub max_protocol_record_bytes: usize,
     pub max_output_bytes: usize,
+    /// 是否向客户端转发上游公开的思考文本；不读取隐藏推理或签名。
+    pub forward_reasoning: bool,
+    /// 是否转发工具调用、参数、执行中的输出和最终结果。
+    pub forward_tools: bool,
 }
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -148,6 +152,8 @@ impl Default for RuntimeConfig {
             cancel_timeout_seconds: 5,
             max_protocol_record_bytes: 8 * 1024 * 1024,
             max_output_bytes: 8 * 1024 * 1024,
+            forward_reasoning: true,
+            forward_tools: true,
         }
     }
 }

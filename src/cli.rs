@@ -238,6 +238,13 @@ async fn serve(mut config: Config) -> Result<()> {
         }
     };
     tracing::info!(listen = %listener.local_addr()?, agent = gateway.config.agent.kind.as_str(), "A2A server ready");
+    tracing::info!(
+        event = "a2a.endpoints", protocol_version = "1.0", transport = "JSONRPC",
+        discovery_url = format!("{}/.well-known/agent-card.json", gateway.config.public_url()),
+        rpc_url = format!("{}/a2a", gateway.config.public_url()),
+        auth = ?gateway.config.auth.mode,
+        "服务入口：GET Agent Card 发现能力，POST /a2a 提交消息；流式方法通过 SSE 返回事件"
+    );
     let shutdown = gateway.clone();
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {

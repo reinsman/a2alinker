@@ -31,6 +31,9 @@ max_concurrent_tasks = 1
 queue_capacity = 20
 task_timeout_seconds = 1800
 session_idle_timeout_seconds = 900
+# 默认转发 pi 公开输出的思考文本、工具参数和执行结果，可按需要分别关闭。
+forward_reasoning = true
+forward_tools = true
 
 [storage]
 directory = "../data/pi-reviewer"

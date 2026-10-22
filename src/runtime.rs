@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     adapters::{
         self, AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome,
+        execution::{EXECUTION_EXTENSION, tool_data, tool_event},
     },
     config::Config,
     skills::SkillSet,
@@ -132,6 +133,15 @@ impl Gateway {
         let skills = discovered.snapshot(&config.storage.directory)?;
         let fingerprint = config.fingerprint(&skills.digest)?;
         let home = adapters::prepare_home(&config, &skills.digest)?;
+        tracing::info!(
+            event = "gateway.config", agent = config.agent.kind.as_str(),
+            workspace = %config.agent.workspace.display(), storage = %config.storage.directory.display(),
+            skill_count = skills.skills.len(), queue_capacity = config.runtime.queue_capacity,
+            selected_skills = ?skills.skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
+            task_timeout_seconds = config.runtime.task_timeout_seconds,
+            private_home = %home.display(), config_digest = fingerprint,
+            "执行配置已准备：技能与原生配置使用实例副本，单个 worker 串行执行任务"
+        );
         let config = Arc::new(config);
         let adapter = AdapterContext {
             config: config.clone(),
@@ -147,6 +157,10 @@ impl Gateway {
         .await
         .context("agent preflight timed out")??;
         drop(preflight);
+        tracing::info!(
+            event = "gateway.preflight",
+            "原生协议握手与技能预检通过；预检不调用模型，模型账号权限尚未验证"
+        );
         let (queue, receiver) = mpsc::channel(config.runtime.queue_capacity);
         let (changes, _) = broadcast::channel(256);
         let gateway = Arc::new(Self {
@@ -216,11 +230,23 @@ impl Gateway {
         let _guard = self.mutation.lock().await;
         if let Some((stored_digest, task_id)) = self.store.duplicate(message.id.as_str()).await? {
             if stored_digest != digest {
+                tracing::warn!(
+                    event = "message.conflict",
+                    message_id = message.id.as_str(),
+                    task_id,
+                    "拒绝消息：相同 messageId 对应不同内容；新消息需要新的 ID"
+                );
                 return Err(ApiError::invalid(
                     "messageId was already used with different content",
                 ));
             }
-            return self.task(&task_id).await;
+            let task = self.task(&task_id).await?;
+            tracing::info!(
+                event = "message.duplicate", message_id = message.id.as_str(), task_id,
+                context_id = task.context_id.as_str(), state = %task.status.state,
+                "命中消息去重：返回原任务，不会重新调用 agent；希望重新执行时请使用新的 messageId"
+            );
+            return Ok(task);
         }
         if let Some(task_id) = &message.task_id {
             return self.reply(task_id.as_str(), &message, &digest).await;
@@ -245,19 +271,32 @@ impl Gateway {
         if let Some(context) = self.store.context(&context_id).await?
             && context.fingerprint != self.fingerprint
         {
+            tracing::warn!(
+                event = "context.config_changed",
+                context_id,
+                "拒绝复用 context：执行配置已变化，请创建新的 context"
+            );
             return Err(ApiError::invalid(
                 "Context belongs to different execution configuration; create a new context",
             ));
         }
         if self.store.active_context(&context_id).await? {
+            tracing::warn!(
+                event = "context.busy",
+                context_id,
+                "同一 context 已有未结束任务，当前消息未入队"
+            );
             return Err(ApiError::unsupported("Context already has an active task"));
         }
         // 先预留队列容量再落库，避免创建了一个没有位置入队的任务。
-        let permit = self
-            .queue
-            .clone()
-            .try_reserve_owned()
-            .map_err(|_| ApiError::unsupported("Task queue is full; retry later"))?;
+        let permit = self.queue.clone().try_reserve_owned().map_err(|_| {
+            tracing::warn!(
+                event = "task.queue_full",
+                capacity = self.config.runtime.queue_capacity,
+                "任务队列已满，当前消息未创建任务，请稍后重试"
+            );
+            ApiError::unsupported("Task queue is full; retry later")
+        })?;
         let mut task = Task::new(uuid::Uuid::new_v4().to_string(), context_id);
         task.history.push(
             message
@@ -289,6 +328,11 @@ impl Gateway {
                 cancel,
                 replies: receiver,
             },
+        );
+        tracing::info!(
+            event = "task.queued", message_id = message.id.as_str(), task_id = task.id.as_str(),
+            context_id = task.context_id.as_str(), state = %task.status.state, prompt_bytes = prompt.len(),
+            "Task 已持久化并准备入队：taskId 标识本次执行，contextId 标识可复用的会话"
         );
         permit.send(Work {
             task_id: task.id.to_string(),
@@ -356,6 +400,11 @@ impl Gateway {
         self.store
             .record_reply(&task, message, digest, &event)
             .await?;
+        tracing::info!(
+            event = "interaction.reply", task_id = id, context_id = task.context_id.as_str(),
+            message_id = message.id.as_str(), interaction_id = interaction.id, method = interaction.method,
+            state = %task.status.state, "交互回复已校验并持久化，转交原生 agent 继续执行；不记录回复内容"
+        );
         permit.send(InteractionReply {
             id: interaction.id,
             response: response.clone(),
@@ -386,12 +435,14 @@ impl Gateway {
                 return Ok(task);
             }
             if task.status.state.is_terminal() {
+                tracing::warn!(event = "task.cancel_rejected", task_id = id, state = %task.status.state, "CancelTask 被拒绝：任务已进入终态");
                 return Err(ApiError {
                     code: -32002,
                     message: "Task is already terminal".into(),
                 });
             }
             if let Some(control) = self.controls.lock().await.get(id) {
+                tracing::info!(event = "task.cancel_requested", task_id = id, context_id = task.context_id.as_str(), state = %task.status.state, "收到 CancelTask：通知执行器中断任务");
                 control.cancel.cancel();
             } else {
                 return Err(ApiError::unsupported("Task has no live execution"));
@@ -401,6 +452,7 @@ impl Gateway {
                 let mut task = task;
                 task.status = TaskStatus::new(TaskState::Canceled);
                 self.store.save_event(&task, &status_event(&task)).await?;
+                tracing::info!(event = "task.finished", task_id = id, context_id = task.context_id.as_str(), state = %task.status.state, "排队任务已取消并持久化，不会发给 agent 执行");
                 let _ = self.changes.send(());
                 return Ok(task);
             }
@@ -418,17 +470,46 @@ impl Gateway {
 
     /// 将统一的 agent 事件应用到 Task，再原子保存快照和对应的 A2A 事件。
     async fn event(&self, id: &str, event: AgentEvent) -> Result<()> {
+        // 关闭的过程内容既不发送，也不进入任务快照和事件数据库。
+        if matches!(&event, AgentEvent::Reasoning { .. }) && !self.config.runtime.forward_reasoning
+            || matches!(&event, AgentEvent::Tool(_)) && !self.config.runtime.forward_tools
+        {
+            return Ok(());
+        }
         let _guard = self.mutation.lock().await;
         let mut task = self.store.task(id).await?.context("task disappeared")?;
         if task.status.state.is_terminal() {
             return Ok(());
         }
+        let previous_state = task.status.state;
         let protocol_event = match event {
             AgentEvent::OutputDelta { item_id, text } => {
                 output_event(&mut task, &item_id, &text, true, false)
             }
             AgentEvent::OutputComplete { item_id, text } => {
                 output_event(&mut task, &item_id, &text, false, true)
+            }
+            AgentEvent::Reasoning {
+                item_id,
+                text,
+                append,
+                last_chunk,
+            } => {
+                if text.is_empty()
+                    && !task
+                        .artifacts
+                        .iter()
+                        .any(|a| a.artifact_id.as_str() == format!("reasoning-{item_id}"))
+                {
+                    return Ok(());
+                }
+                text_event(&mut task, &item_id, &text, append, last_chunk, "reasoning")
+            }
+            AgentEvent::Tool(event) => {
+                if !matches!(event.phase, adapters::ToolPhase::Update) {
+                    tracing::info!(event = "tool.execution", task_id = id, tool_call_id = event.call_id.as_str(), tool = event.name.as_str(), phase = ?event.phase, "工具执行状态更新；参数和结果通过 A2A 返回，不写入日志");
+                }
+                StreamResponse::StatusUpdate(tool_event(&mut task, event))
             }
             AgentEvent::Progress(text) => {
                 if !task.status.state.is_interrupted() {
@@ -460,18 +541,79 @@ impl Gateway {
                 status_event(&task)
             }
         };
-        let output_bytes: usize = task
+        let mut output_bytes: usize = task
             .artifacts
             .iter()
             .flat_map(|a| &a.parts)
             .filter_map(Part::as_text)
             .map(str::len)
             .sum();
+        // 工具参数和结果也纳入输出限额；累计输出快照替换原记录，不重复计数。
+        for message in task
+            .history
+            .iter()
+            .filter(|message| tool_data(message).is_some())
+        {
+            output_bytes += serde_json::to_vec(&message.parts)?.len();
+        }
         ensure!(
             output_bytes <= self.config.runtime.max_output_bytes,
             "Task output exceeded max_output_bytes"
         );
         self.store.save_event(&task, &protocol_event).await?;
+        match &protocol_event {
+            StreamResponse::ArtifactUpdate(update) if update.last_chunk => {
+                tracing::info!(
+                    event = "artifact.complete",
+                    task_id = id,
+                    context_id = task.context_id.as_str(),
+                    artifact_id = update.artifact.artifact_id.as_str(),
+                    output_bytes,
+                    append = update.append,
+                    last_chunk = update.last_chunk,
+                    "收到完整输出：用最终文本更新 Artifact；产物结束不等于整个 Task 已结束"
+                );
+            }
+            StreamResponse::ArtifactUpdate(update) if !update.append => {
+                tracing::info!(
+                    event = "artifact.started",
+                    task_id = id,
+                    context_id = task.context_id.as_str(),
+                    artifact_id = update.artifact.artifact_id.as_str(),
+                    "开始生成 Artifact：后续文本增量将更新同一产物"
+                );
+            }
+            StreamResponse::ArtifactUpdate(update) => {
+                tracing::debug!(
+                    event = "artifact.delta",
+                    task_id = id,
+                    artifact_id = update.artifact.artifact_id.as_str(),
+                    output_bytes,
+                    append = update.append,
+                    "文本增量已保存；只记录累计字节数，不记录正文"
+                );
+            }
+            StreamResponse::StatusUpdate(_) if previous_state != task.status.state => {
+                tracing::info!(event = "task.state", task_id = id, context_id = task.context_id.as_str(), from = %previous_state, to = %task.status.state, "Task 状态已更新并持久化，订阅者可读取 statusUpdate");
+                if let Some(pending) = task
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("pendingInteraction"))
+                {
+                    tracing::info!(
+                        event = "interaction.pending",
+                        task_id = id,
+                        interaction_id = pending["id"].as_str(),
+                        method = pending["method"].as_str(),
+                        kind = pending["kind"].as_str(),
+                        "agent 等待输入或审批：客户端需发送匹配 interactionId 的结构化回复"
+                    );
+                }
+            }
+            _ => {
+                tracing::debug!(event = "agent.progress", task_id = id, state = %task.status.state, "agent 进度事件已保存；不记录工具参数或命令正文")
+            }
+        }
         let _ = self.changes.send(());
         Ok(())
     }
@@ -495,6 +637,13 @@ impl Gateway {
                 let text = task
                     .artifacts
                     .iter()
+                    .filter(|artifact| {
+                        artifact
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("a2alinker"))
+                            .is_none_or(|metadata| metadata["kind"] != "reasoning")
+                    })
                     .flat_map(|a| &a.parts)
                     .filter_map(Part::as_text)
                     .collect::<Vec<_>>()
@@ -508,6 +657,11 @@ impl Gateway {
                 }
             }
             self.store.save_event(&task, &status_event(&task)).await?;
+            if state == TaskState::Failed {
+                tracing::warn!(event = "task.finished", task_id = id, context_id = task.context_id.as_str(), state = %state, "Task 已失败并持久化；通过 GetTask 查看 status.message 中的具体错误");
+            } else {
+                tracing::info!(event = "task.finished", task_id = id, context_id = task.context_id.as_str(), state = %state, artifact_count = task.artifacts.len(), "Task 已进入终态并持久化；可以查询结果，同一 context 的后续消息使用新的 messageId");
+            }
             let _ = self.changes.send(());
         }
         self.controls.lock().await.remove(id);
@@ -516,6 +670,12 @@ impl Gateway {
     }
 
     pub async fn shutdown(&self) {
+        if !self.shutdown.is_cancelled() {
+            tracing::info!(
+                event = "gateway.shutdown",
+                "开始关闭网关：取消执行和排队任务，持久化终态并清理 agent 进程"
+            );
+        }
         self.shutdown.cancel();
         if let Some(worker) = self.worker.lock().await.take() {
             let _ = worker.await;
@@ -545,7 +705,32 @@ fn output_event(
     append: bool,
     final_chunk: bool,
 ) -> StreamResponse {
-    let id = format!("output-{item_id}");
+    text_event(task, item_id, text, append, final_chunk, "answer")
+}
+
+/// 回答和公开思考使用不同 ID 与 metadata，最终聊天历史仅收集回答。
+fn text_event(
+    task: &mut Task,
+    item_id: &str,
+    text: &str,
+    append: bool,
+    final_chunk: bool,
+    kind: &str,
+) -> StreamResponse {
+    let prefix = if kind == "reasoning" {
+        "reasoning"
+    } else {
+        "output"
+    };
+    let id = format!("{prefix}-{item_id}");
+    let artifact = |text: &str| {
+        let mut artifact = Artifact::new(id.clone(), vec![Part::text(text)]);
+        artifact.metadata = Some(HashMap::from([("a2alinker".into(), json!({"kind":kind}))]));
+        if kind == "reasoning" {
+            artifact.extensions.push(EXECUTION_EXTENSION.into());
+        }
+        artifact
+    };
     let index = task
         .artifacts
         .iter()
@@ -563,14 +748,10 @@ fn output_event(
             text.into()
         })];
     } else {
-        task.artifacts
-            .push(Artifact::new(id.clone(), vec![Part::text(text)]));
+        task.artifacts.push(artifact(text));
     }
-    let mut event = TaskArtifactUpdateEvent::new(
-        task.id.clone(),
-        task.context_id.clone(),
-        Artifact::new(id, vec![Part::text(text)]),
-    );
+    let mut event =
+        TaskArtifactUpdateEvent::new(task.id.clone(), task.context_id.clone(), artifact(text));
     event.append = actual_append;
     event.last_chunk = final_chunk;
     StreamResponse::ArtifactUpdate(event)
@@ -591,7 +772,13 @@ async fn worker(
             biased;
             _ = shutdown.cancelled() => break,
             _ = cleanup.tick() => {
-                sessions.retain(|_, s| s.used.elapsed().as_secs() < adapter.config.runtime.session_idle_timeout_seconds && s.session.is_alive());
+                sessions.retain(|context_id, s| {
+                    let keep = s.used.elapsed().as_secs() < adapter.config.runtime.session_idle_timeout_seconds && s.session.is_alive();
+                    if !keep {
+                        tracing::info!(event = "session.released", context_id, native_session_id = s.session.native_id(), "释放空闲或已退出的 agent 会话进程；保留会话文件以便后续恢复");
+                    }
+                    keep
+                });
                 continue;
             }
             work = receiver.recv() => match work { Some(work) => work, None => break },
@@ -612,6 +799,11 @@ async fn worker(
         }
     }
     receiver.close();
+    tracing::info!(
+        event = "worker.stopped",
+        session_count = sessions.len(),
+        "任务执行器停止，清理会话进程和剩余任务"
+    );
     sessions.clear();
     if let Some(gateway) = weak.upgrade() {
         let ids: Vec<_> = gateway.controls.lock().await.keys().cloned().collect();
@@ -630,6 +822,7 @@ async fn execute(
     sessions: &mut HashMap<String, SessionEntry>,
     work: Work,
 ) -> Result<()> {
+    let started = Instant::now();
     let task = gateway
         .store
         .task(&work.task_id)
@@ -668,12 +861,19 @@ async fn execute(
             .store
             .save_event(&task, &status_event(&task))
             .await?;
+        tracing::info!(event = "task.started", task_id = work.task_id, context_id, from = "TASK_STATE_SUBMITTED", to = %task.status.state, "worker 取出 Task 开始执行，保存 WORKING 状态");
         let _ = gateway.changes.send(());
     }
     if sessions
         .get_mut(&context_id)
         .is_some_and(|entry| !entry.session.is_alive())
     {
+        tracing::warn!(
+            event = "session.unavailable",
+            task_id = work.task_id,
+            context_id,
+            "缓存中的 agent 进程已退出，将尝试恢复原生会话"
+        );
         sessions.remove(&context_id);
     }
     if !sessions.contains_key(&context_id) {
@@ -683,6 +883,11 @@ async fn execute(
                 .min_by_key(|(_, s)| s.used)
                 .map(|(id, _)| id.clone())
         {
+            tracing::info!(
+                event = "session.evicted",
+                context_id = oldest,
+                "会话缓存达到上限，释放最久未使用的进程；会话历史仍然保留"
+            );
             sessions.remove(&oldest);
         }
         let stored = gateway
@@ -690,6 +895,18 @@ async fn execute(
             .context(&context_id)
             .await?
             .context("context disappeared")?;
+        tracing::info!(
+            event = "session.opening",
+            task_id = work.task_id,
+            context_id,
+            action = if stored.native_id.is_some() {
+                "resume"
+            } else {
+                "create"
+            },
+            agent = adapter.config.agent.kind.as_str(),
+            "为 context 创建或恢复原生会话；A2A contextId 与原生会话标识通过数据库映射"
+        );
         let start = tokio::time::timeout(
             Duration::from_secs(adapter.config.runtime.startup_timeout_seconds),
             adapters::create_session(adapter, &context_id, stored.native_id.as_deref()),
@@ -704,6 +921,13 @@ async fn execute(
             .store
             .set_native_id(&context_id, session.native_id())
             .await?;
+        tracing::info!(
+            event = "session.ready",
+            task_id = work.task_id,
+            context_id,
+            native_session_id = session.native_id(),
+            "原生会话就绪，映射已保存；pi 的新 JSONL 文件通常在首次 assistant 消息后生成"
+        );
         sessions.insert(
             context_id.clone(),
             SessionEntry {
@@ -711,8 +935,23 @@ async fn execute(
                 used: Instant::now(),
             },
         );
+    } else {
+        tracing::info!(
+            event = "session.reused",
+            task_id = work.task_id,
+            context_id,
+            native_session_id = sessions[&context_id].session.native_id(),
+            "复用同一 context 的存活会话，保留对话上下文"
+        );
     }
     let result = {
+        tracing::info!(
+            event = "agent.run",
+            task_id = work.task_id,
+            context_id,
+            prompt_bytes = work.prompt.len(),
+            "向 agent 提交本轮消息，开始接收输出、进度或交互事件；不记录提示词正文"
+        );
         let session = &mut sessions.get_mut(&context_id).unwrap().session;
         let (events, mut incoming) = mpsc::channel(128);
         let run = session.run(
@@ -734,15 +973,21 @@ async fn execute(
                         && let Err(error) = gateway.event(&work.task_id, event).await { break Err(error); }
                 }
                 _ = control.cancel.cancelled(), if !interrupted => {
+                    tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, grace_seconds = adapter.config.runtime.cancel_timeout_seconds, "通知原生 agent 中断；超过宽限时间后会释放进程");
                     interrupted = true;
                     deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
                 }
                 _ = gateway.shutdown.cancelled(), if !interrupted => {
+                    tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, "网关关闭，通知原生 agent 中断当前任务");
                     control.cancel.cancel(); interrupted = true;
                     deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    if interrupted { break if timed_out { Err(anyhow!("Task timed out")) } else { Ok(RunOutcome::Canceled) }; }
+                    if interrupted {
+                        tracing::warn!(event = "agent.interrupt_timeout", task_id = work.task_id, context_id, "原生中断超过宽限时间，将释放会话并清理进程组");
+                        break if timed_out { Err(anyhow!("Task timed out")) } else { Ok(RunOutcome::Canceled) };
+                    }
+                    tracing::warn!(event = "task.timeout", task_id = work.task_id, context_id, timeout_seconds = adapter.config.runtime.task_timeout_seconds, "任务达到时间上限，先尝试原生中断，再清理进程");
                     timed_out = true; interrupted = true; control.cancel.cancel();
                     deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
                 }
@@ -764,13 +1009,21 @@ async fn execute(
     };
     // 失败/取消时释放会话及进程；成功的会话留下以供同一 context 后续任务复用。
     if state != TaskState::Completed {
+        tracing::info!(
+            event = "session.released",
+            task_id = work.task_id,
+            context_id,
+            "任务失败或取消，释放原生会话进程；已生成的会话文件不会删除"
+        );
         sessions.remove(&context_id);
     } else if let Some(session) = sessions.get_mut(&context_id) {
         session.used = Instant::now();
     }
     gateway
         .finish(&work.task_id, state, result.err().map(|e| e.to_string()))
-        .await
+        .await?;
+    tracing::info!(event = "task.execution_end", task_id = work.task_id, context_id, state = %state, elapsed_ms = started.elapsed().as_millis() as u64, "本轮执行已结束；耗时包含会话准备、模型处理和等待交互，不含排队时间");
+    Ok(())
 }
 
 pub fn trim_history(task: &mut Task, length: Option<i32>) {

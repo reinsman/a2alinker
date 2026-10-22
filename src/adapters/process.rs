@@ -126,6 +126,13 @@ impl JsonlProcess {
     pub async fn request(&mut self, method: &str, params: Value, pi: bool) -> Result<Value> {
         self.next_id += 1;
         let id = format!("linker-{}", self.next_id);
+        tracing::debug!(
+            event = "agent.command",
+            native_request_id = id,
+            method,
+            protocol = if pi { "pi-rpc" } else { "codex-app-server" },
+            "向原生 agent 发送命令；不记录 params 或提示词"
+        );
         let value = if pi {
             let mut p = params.as_object().cloned().unwrap_or_default();
             p.insert("id".into(), json!(id));
@@ -140,6 +147,12 @@ impl JsonlProcess {
             if record.get("id").and_then(Value::as_str) == Some(&id)
                 && (!pi || record["type"] == "response")
             {
+                tracing::debug!(
+                    event = "agent.response",
+                    native_request_id = id,
+                    method,
+                    "收到匹配的原生协议响应；命令响应不代表整个 A2A Task 已完成"
+                );
                 if pi {
                     ensure!(
                         record["success"] == true,

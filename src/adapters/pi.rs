@@ -1,8 +1,8 @@
 //! pi 的 RPC 适配器：会话以 JSONL 文件保存，事件通过标准输入/输出传输。
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -10,8 +10,8 @@ use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome,
-    process::JsonlProcess,
+    AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome, ToolEvent,
+    ToolPhase, process::JsonlProcess,
 };
 
 pub struct PiSession {
@@ -126,6 +126,8 @@ impl AgentSession for PiSession {
         let mut deadline = Instant::now() + Duration::from_secs(86400 * 365);
         let mut last_error = None;
         let mut item_id = String::new();
+        let mut text_started = false;
+        let mut completed_reasoning = HashSet::<usize>::new();
         let mut pending: Option<String> = None;
         loop {
             tokio::select! {
@@ -154,10 +156,27 @@ impl AgentSession for PiSession {
                         "message_start" if record["message"]["role"] == "assistant" => {
                             self.message_count += 1;
                             item_id = format!("pi-{}", self.message_count);
+                            text_started = false;
+                            completed_reasoning.clear();
                         }
                         "message_update" if record["assistantMessageEvent"]["type"] == "text_delta" => {
                             if let Some(text) = record["assistantMessageEvent"]["delta"].as_str() {
+                                text_started = true;
                                 events.send(AgentEvent::OutputDelta { item_id: item_id.clone(), text: text.into() }).await?;
+                            }
+                        }
+                        "message_update" if matches!(record["assistantMessageEvent"]["type"].as_str(), Some("thinking_delta" | "thinking_end")) => {
+                            let update = &record["assistantMessageEvent"];
+                            let index = update["contentIndex"].as_u64().unwrap_or(0) as usize;
+                            let complete = update["type"] == "thinking_end";
+                            // 只取公开文本；不转发 thinkingSignature、加密内容或完整原生报文。
+                            let text = update[if complete { "content" } else { "delta" }].as_str();
+                            if let Some(text) = text {
+                                events.send(AgentEvent::Reasoning {
+                                    item_id: format!("{item_id}-{index}"), text: text.into(),
+                                    append: !complete, last_chunk: complete,
+                                }).await?;
+                                if complete { completed_reasoning.insert(index); }
                             }
                         }
                         "message_end" if record["message"]["role"] == "assistant" => {
@@ -165,10 +184,38 @@ impl AgentSession for PiSession {
                             let text = message["content"].as_array().map(|parts| parts.iter().filter(|p| p["type"] == "text")
                                 .filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
                             last_error = if message["stopReason"] == "error" { Some(message["errorMessage"].as_str().unwrap_or("Pi model error").to_string()) } else { None };
-                            events.send(AgentEvent::OutputComplete { item_id: item_id.clone(), text }).await?;
+                            if let Some(parts) = message["content"].as_array() {
+                                for (index, part) in parts.iter().enumerate() {
+                                    // 兼容未发送 thinking_end 的版本，以消息中的完整文本补齐。
+                                    if part["type"] == "thinking" && !completed_reasoning.contains(&index)
+                                        && let Some(text) = part["thinking"].as_str()
+                                    {
+                                        events.send(AgentEvent::Reasoning {
+                                            item_id: format!("{item_id}-{index}"), text: text.into(),
+                                            append: false, last_chunk: true,
+                                        }).await?;
+                                    }
+                                }
+                            }
+                            // 只有工具调用或思考的消息，不再生成空的回答 Artifact。
+                            if text_started || !text.is_empty() {
+                                events.send(AgentEvent::OutputComplete { item_id: item_id.clone(), text }).await?;
+                            }
                         }
-                        "tool_execution_start" => {
-                            events.send(AgentEvent::Progress(format!("Running tool: {}", record["toolName"].as_str().unwrap_or("tool")))).await?;
+                        "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
+                            let phase = match record["type"].as_str() {
+                                Some("tool_execution_start") => ToolPhase::Start,
+                                Some("tool_execution_update") => ToolPhase::Update,
+                                _ => ToolPhase::End,
+                            };
+                            events.send(AgentEvent::Tool(ToolEvent {
+                                call_id: record["toolCallId"].as_str().context("Pi tool event missing toolCallId")?.into(),
+                                name: record["toolName"].as_str().unwrap_or("tool").into(),
+                                phase,
+                                arguments: record.get("args").cloned(),
+                                result: record.get(if matches!(phase, ToolPhase::Update) { "partialResult" } else { "result" }).cloned(),
+                                is_error: record["isError"].as_bool(),
+                            })).await?;
                         }
                         // 等待包括自动重试在内的整轮工作结束，不能把中间 agent_end 当终态。
                         "agent_settled" => {

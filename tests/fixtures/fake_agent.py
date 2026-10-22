@@ -67,6 +67,38 @@ def finish(canceled=False, error=None):
         note("turn/completed", {"turn": {"id": TURN, "status": "interrupted" if canceled else "failed" if error else "completed", "error": {"message": error} if error else None}})
 
 
+def execution(prompt):
+    """Public execution notifications; no actual shell command or model request."""
+    emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
+    thinking = "x" * 2048 if prompt == "reasoning-large" else "检查仓库结构。"
+    emit({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": thinking[:3]}})
+    emit({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": thinking[3:]}})
+    emit({"type": "message_update", "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": thinking}})
+    # Second block deliberately has no thinking_end, exercising message_end fallback.
+    emit({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 1, "delta": "再查看"}})
+    emit({"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse", "content": [
+        {"type": "thinking", "thinking": thinking, "thinkingSignature": "SIGNATURE_MUST_NOT_BE_FORWARDED"},
+        {"type": "thinking", "thinking": "再查看文件。"},
+        {"type": "toolCall", "id": "call-bash", "name": "bash", "arguments": {"command": "ls -la"}},
+    ]}})
+    arguments = {"command": "x" * 2048 if prompt == "arguments-large" else "ls -la", "headers": {"Authorization": "TOOL_SECRET_MUST_BE_REDACTED"}}
+    emit({"type": "tool_execution_start", "toolCallId": "call-bash", "toolName": "bash", "args": arguments})
+    emit({"type": "tool_execution_start", "toolCallId": "call-read", "toolName": "read", "args": {"path": "missing.txt"}})
+    for output in ["文件A\n", "文件A\n文件B\n"]:
+        emit({"type": "tool_execution_update", "toolCallId": "call-bash", "toolName": "bash", "args": arguments,
+              "partialResult": {"content": [{"type": "text", "text": output}], "details": {"truncation": None}}})
+    if prompt == "execution-pause":
+        CANCEL.wait(20)
+        finish(canceled=True)
+        return False
+    emit({"type": "tool_execution_end", "toolCallId": "call-read", "toolName": "read", "isError": True,
+          "result": {"content": [{"type": "text", "text": "File not found"}], "details": {"exitCode": 1}}})
+    output = "x" * 2048 if prompt == "tool-large" else "文件A\n文件B\n"
+    emit({"type": "tool_execution_end", "toolCallId": "call-bash", "toolName": "bash", "isError": False,
+          "result": {"content": [{"type": "text", "text": output}], "details": {"exitCode": 0, "api_key": "RESULT_SECRET_MUST_BE_REDACTED"}}})
+    return True
+
+
 def run(prompt, count):
     global PENDING
     if prompt == "crash":
@@ -87,7 +119,7 @@ def run(prompt, count):
         PENDING = "fixture-ui" if PI else 42
         if PI:
             emit({"type": "extension_ui_request", "id": PENDING, "method": "confirm", "title": "Run fixture operation?"})
-            emit({"type": "tool_execution_start", "toolName": "background-tool"})
+            emit({"type": "tool_execution_start", "toolCallId": "call-background", "toolName": "background-tool", "args": {}})
         else:
             emit({"id": PENDING, "method": "item/commandExecution/requestApproval", "params": {"threadId": THREAD, "turnId": TURN, "itemId": "command-1", "command": "echo fixture"}})
             note("item/started", {"turnId": TURN, "item": {"type": "commandExecution", "id": "background-tool"}})
@@ -104,6 +136,9 @@ def run(prompt, count):
         emit({"type": "message_end", "message": {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": "transient failure"}})
         emit({"type": "agent_end", "messages": [], "willRetry": True})
         time.sleep(0.05)
+    if PI and prompt in ("execution", "execution-pause", "reasoning-large", "arguments-large", "tool-large"):
+        if not execution(prompt):
+            return
     text = "x" * 2048 if prompt == "large" else "hello\u2028world" if prompt == "unicode" else "Hello " + str(count)
     item = "message-" + str(count)
     if PI:
