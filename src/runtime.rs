@@ -25,7 +25,7 @@ use crate::{
         self, AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome,
         execution::{EXECUTION_EXTENSION, tool_data, tool_event},
     },
-    config::Config,
+    options::Options,
     skills::SkillSet,
     storage::{Store, metadata},
 };
@@ -95,7 +95,7 @@ struct SessionEntry {
 
 /// Arc 允许路由、请求和后台任务共同持有网关，不会复制整个网关及数据库。
 pub struct Gateway {
-    pub config: Arc<Config>,
+    pub options: Arc<Options>,
     pub skills: SkillSet,
     pub store: Arc<Store>,
     pub fingerprint: String,
@@ -112,46 +112,40 @@ pub struct Gateway {
 
 impl Gateway {
     /// 初始化存储、技能与原生协议，恢复历史状态，然后启动唯一的执行 worker。
-    pub async fn open(mut config: Config) -> Result<Arc<Self>> {
-        config.agent.workspace = config
+    pub async fn open(mut options: Options) -> Result<Arc<Self>> {
+        options.resolve()?;
+        options.agent.workspace = options
             .agent
             .workspace
             .canonicalize()
             .context("canonicalize workspace")?;
-        config.validate()?;
-        let discovered = SkillSet::discover(&config)?;
-        for cap in &config.capabilities {
-            for skill in &cap.required_skills {
-                ensure!(
-                    discovered.skills.iter().any(|s| &s.name == skill),
-                    "capability {} requires unavailable skill {skill}",
-                    cap.id
-                );
-            }
-        }
-        let store = Arc::new(Store::open(&config.storage.directory).await?);
-        let skills = discovered.snapshot(&config.storage.directory)?;
-        let fingerprint = config.fingerprint(&skills.digest)?;
-        let home = adapters::prepare_home(&config, &skills.digest)?;
+        options.validate()?;
+        let discovered = SkillSet::discover(&options)?;
+        let storage = options.instance_directory()?;
+        let store = Arc::new(Store::open(&storage).await?);
+        let skills = discovered.snapshot(&storage)?;
+        let fingerprint = options.fingerprint(&skills.digest)?;
+        let home = adapters::prepare_home(&options, &skills.digest)?;
         tracing::info!(
-            event = "gateway.config", agent = config.agent.kind.as_str(),
-            workspace = %config.agent.workspace.display(), storage = %config.storage.directory.display(),
-            skill_count = skills.skills.len(), queue_capacity = config.runtime.queue_capacity,
+            event = "gateway.config", agent = options.agent.kind.as_str(),
+            workspace = %options.agent.workspace.display(), storage_root = %options.storage.directory.display(), storage = %storage.display(),
+            skill_count = skills.skills.len(), queue_capacity = options.runtime.queue_capacity,
+            inherit_native_skills = options.skills.inherit_user,
             selected_skills = ?skills.skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
-            task_timeout_seconds = config.runtime.task_timeout_seconds,
+            task_timeout_seconds = options.runtime.task_timeout_seconds,
             private_home = %home.display(), config_digest = fingerprint,
             "执行配置已准备：技能与原生配置使用实例副本，单个 worker 串行执行任务"
         );
-        let config = Arc::new(config);
+        let options = Arc::new(options);
         let adapter = AdapterContext {
-            config: config.clone(),
+            options: options.clone(),
             skills: skills.clone(),
             home,
         };
         // 正式对外报告就绪前，验证原生协议和选中技能；此时不请求模型推理。
         let preflight_id = uuid::Uuid::new_v4().to_string();
         let preflight = tokio::time::timeout(
-            Duration::from_secs(config.runtime.startup_timeout_seconds),
+            Duration::from_secs(options.runtime.startup_timeout_seconds),
             adapters::create_session(&adapter, &preflight_id, None),
         )
         .await
@@ -161,10 +155,10 @@ impl Gateway {
             event = "gateway.preflight",
             "原生协议握手与技能预检通过；预检不调用模型，模型账号权限尚未验证"
         );
-        let (queue, receiver) = mpsc::channel(config.runtime.queue_capacity);
+        let (queue, receiver) = mpsc::channel(options.runtime.queue_capacity);
         let (changes, _) = broadcast::channel(256);
         let gateway = Arc::new(Self {
-            config,
+            options,
             skills,
             store,
             fingerprint,
@@ -292,7 +286,7 @@ impl Gateway {
         let permit = self.queue.clone().try_reserve_owned().map_err(|_| {
             tracing::warn!(
                 event = "task.queue_full",
-                capacity = self.config.runtime.queue_capacity,
+                capacity = self.options.runtime.queue_capacity,
                 "任务队列已满，当前消息未创建任务，请稍后重试"
             );
             ApiError::unsupported("Task queue is full; retry later")
@@ -306,7 +300,7 @@ impl Gateway {
         );
         metadata(&mut task).insert(
             "a2alinker".into(),
-            json!({"agent":self.config.agent.kind.as_str(),"configDigest":self.fingerprint,
+            json!({"agent":self.options.agent.kind.as_str(),"configDigest":self.fingerprint,
             "skillsDigest":self.skills.digest,"runId":uuid::Uuid::new_v4().to_string()}),
         );
         self.store
@@ -471,8 +465,8 @@ impl Gateway {
     /// 将统一的 agent 事件应用到 Task，再原子保存快照和对应的 A2A 事件。
     async fn event(&self, id: &str, event: AgentEvent) -> Result<()> {
         // 关闭的过程内容既不发送，也不进入任务快照和事件数据库。
-        if matches!(&event, AgentEvent::Reasoning { .. }) && !self.config.runtime.forward_reasoning
-            || matches!(&event, AgentEvent::Tool(_)) && !self.config.runtime.forward_tools
+        if matches!(&event, AgentEvent::Reasoning { .. }) && !self.options.runtime.forward_reasoning
+            || matches!(&event, AgentEvent::Tool(_)) && !self.options.runtime.forward_tools
         {
             return Ok(());
         }
@@ -557,7 +551,7 @@ impl Gateway {
             output_bytes += serde_json::to_vec(&message.parts)?.len();
         }
         ensure!(
-            output_bytes <= self.config.runtime.max_output_bytes,
+            output_bytes <= self.options.runtime.max_output_bytes,
             "Task output exceeded max_output_bytes"
         );
         self.store.save_event(&task, &protocol_event).await?;
@@ -773,7 +767,7 @@ async fn worker(
             _ = shutdown.cancelled() => break,
             _ = cleanup.tick() => {
                 sessions.retain(|context_id, s| {
-                    let keep = s.used.elapsed().as_secs() < adapter.config.runtime.session_idle_timeout_seconds && s.session.is_alive();
+                    let keep = s.used.elapsed().as_secs() < adapter.options.runtime.session_idle_timeout_seconds && s.session.is_alive();
                     if !keep {
                         tracing::info!(event = "session.released", context_id, native_session_id = s.session.native_id(), "释放空闲或已退出的 agent 会话进程；保留会话文件以便后续恢复");
                     }
@@ -877,7 +871,7 @@ async fn execute(
         sessions.remove(&context_id);
     }
     if !sessions.contains_key(&context_id) {
-        if sessions.len() >= adapter.config.runtime.max_sessions
+        if sessions.len() >= adapter.options.runtime.max_sessions
             && let Some(oldest) = sessions
                 .iter()
                 .min_by_key(|(_, s)| s.used)
@@ -904,11 +898,11 @@ async fn execute(
             } else {
                 "create"
             },
-            agent = adapter.config.agent.kind.as_str(),
+            agent = adapter.options.agent.kind.as_str(),
             "为 context 创建或恢复原生会话；A2A contextId 与原生会话标识通过数据库映射"
         );
         let start = tokio::time::timeout(
-            Duration::from_secs(adapter.config.runtime.startup_timeout_seconds),
+            Duration::from_secs(adapter.options.runtime.startup_timeout_seconds),
             adapters::create_session(adapter, &context_id, stored.native_id.as_deref()),
         );
         // 启动握手也可被取消；即使 agent 没有回应，外层仍有超时保证。
@@ -963,7 +957,7 @@ async fn execute(
         // Future 固定位置后，可在循环中反复等待同一次 run，而不会重复启动推理。
         tokio::pin!(run);
         let mut deadline =
-            Instant::now() + Duration::from_secs(adapter.config.runtime.task_timeout_seconds);
+            Instant::now() + Duration::from_secs(adapter.options.runtime.task_timeout_seconds);
         let mut interrupted = false;
         let mut timed_out = false;
         loop {
@@ -973,23 +967,23 @@ async fn execute(
                         && let Err(error) = gateway.event(&work.task_id, event).await { break Err(error); }
                 }
                 _ = control.cancel.cancelled(), if !interrupted => {
-                    tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, grace_seconds = adapter.config.runtime.cancel_timeout_seconds, "通知原生 agent 中断；超过宽限时间后会释放进程");
+                    tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, grace_seconds = adapter.options.runtime.cancel_timeout_seconds, "通知原生 agent 中断；超过宽限时间后会释放进程");
                     interrupted = true;
-                    deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
+                    deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
                 _ = gateway.shutdown.cancelled(), if !interrupted => {
                     tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, "网关关闭，通知原生 agent 中断当前任务");
                     control.cancel.cancel(); interrupted = true;
-                    deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
+                    deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     if interrupted {
                         tracing::warn!(event = "agent.interrupt_timeout", task_id = work.task_id, context_id, "原生中断超过宽限时间，将释放会话并清理进程组");
                         break if timed_out { Err(anyhow!("Task timed out")) } else { Ok(RunOutcome::Canceled) };
                     }
-                    tracing::warn!(event = "task.timeout", task_id = work.task_id, context_id, timeout_seconds = adapter.config.runtime.task_timeout_seconds, "任务达到时间上限，先尝试原生中断，再清理进程");
+                    tracing::warn!(event = "task.timeout", task_id = work.task_id, context_id, timeout_seconds = adapter.options.runtime.task_timeout_seconds, "任务达到时间上限，先尝试原生中断，再清理进程");
                     timed_out = true; interrupted = true; control.cancel.cancel();
-                    deadline = Instant::now() + Duration::from_secs(adapter.config.runtime.cancel_timeout_seconds);
+                    deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
                 result = &mut run => {
                     let mut result = result;

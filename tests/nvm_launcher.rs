@@ -10,12 +10,12 @@ use std::{
 
 use a2alinker::{
     adapters,
-    config::{AgentKind, Config},
+    options::{AgentKind, Options},
     runtime::Gateway,
 };
 use ra2a::types::{Message, TaskState};
 
-fn install_mock_nvm(root: &Path) -> (Config, PathBuf) {
+fn install_mock_nvm(root: &Path) -> (Options, PathBuf) {
     let nvm = root.join("nvm with spaces");
     let bin = nvm.join("versions/node/v24.20.0/bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -38,10 +38,7 @@ nvm() {
         bin.join("pi"),
     )
     .unwrap();
-    let mut cfg = Config {
-        schema_version: 1,
-        ..Config::default()
-    };
+    let mut cfg = Options::default();
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent.executable = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/pi-nvm"));
     cfg.agent.workspace = root.into();
@@ -70,7 +67,7 @@ fn executable(path: &Path, content: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn launcher(cfg: &Config) -> Command {
+fn launcher(cfg: &Options) -> Command {
     let mut command = Command::new(cfg.executable());
     command.envs(&cfg.agent.env);
     command

@@ -26,6 +26,10 @@ TURN = None
 PENDING = None
 ROOTS = []
 ENABLED = {}
+STARTUP_TRACE = os.environ.get("A2ALINKER_TEST_TRACE")
+if STARTUP_TRACE:
+    with open(STARTUP_TRACE, "a") as f:
+        f.write(json.dumps({"pid": os.getpid(), "startup": {"args": sys.argv[1:]}}) + "\n")
 if PI:
     SESSION = pathlib.Path(sys.argv[sys.argv.index("--session") + 1])
 else:
@@ -172,13 +176,16 @@ for line in sys.stdin:
         response(request)
     elif method == "skills/list":
         skills = []
-        for root in ROOTS:
+        for root in [HOME / "skills", *ROOTS]:
             for path in pathlib.Path(root).rglob("SKILL.md"):
                 name = re.search(r"^name: (.+)$", path.read_text(), re.M).group(1)
-                skills.append({"name": name, "path": str(path), "enabled": ENABLED.get(str(path), True)})
+                native_enabled = not re.search(r"^enabled: false$", path.read_text(), re.M)
+                skills.append({"name": name, "path": str(path), "enabled": ENABLED.get(str(path), native_enabled)})
         response(request, {"data": [{"cwd": os.getcwd(), "skills": skills, "errors": []}]})
     elif method == "get_commands":
         paths = [pathlib.Path(sys.argv[i + 1]) for i, value in enumerate(sys.argv) if value == "--skill"]
+        if "--no-skills" not in sys.argv:
+            paths.extend((pathlib.Path(os.environ["PI_CODING_AGENT_DIR"]) / "skills").rglob("SKILL.md"))
         response(request, {"commands": [{"source": "skill", "name": "skill:" + re.search(r"^name: (.+)$", p.read_text(), re.M).group(1)} for p in paths]})
     elif method in ("thread/start", "thread/resume"):
         THREAD = request["params"].get("threadId", "fixture-" + str(uuid.uuid4()))

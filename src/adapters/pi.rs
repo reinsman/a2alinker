@@ -28,7 +28,7 @@ impl PiSession {
         context_id: &str,
         native: Option<&str>,
     ) -> Result<Self> {
-        let session_dir = context.config.storage.directory.join("sessions");
+        let session_dir = context.options.instance_directory()?.join("sessions");
         std::fs::create_dir_all(&session_dir)?;
         // 外部 contextId 先哈希成文件名，避免客户端通过 ../ 等内容控制会话文件路径。
         let path = native.map(std::path::PathBuf::from).unwrap_or_else(|| {
@@ -47,22 +47,22 @@ impl PiSession {
             "--session".into(),
             path.to_string_lossy().into(),
         ];
-        if !context.config.skills.inherit_user {
+        if !context.options.skills.inherit_user {
             args.push("--no-skills".into());
         }
-        if !context.config.agent.allow_extensions {
+        if !context.options.agent.allow_extensions {
             args.push("--no-extensions".into());
         }
         for skill in &context.skills.skills {
             args.extend(["--skill".into(), skill.path.to_string_lossy().into()]);
         }
-        if let Some(model) = &context.config.agent.model {
+        if let Some(model) = &context.options.agent.model {
             args.extend(["--model".into(), model.clone()]);
         }
-        if let Some(provider) = &context.config.agent.provider {
+        if let Some(provider) = &context.options.agent.provider {
             args.extend(["--provider".into(), provider.clone()]);
         }
-        args.extend(context.config.agent.args.clone());
+        args.extend(context.options.agent.args.clone());
         let mut process = JsonlProcess::spawn(context, &args)?;
         let state = process.request("get_state", json!({}), true).await?;
         // 只记录选择的模型标识，不输出可能含端点、请求头等信息的完整 model 对象。
@@ -96,7 +96,7 @@ impl PiSession {
         Ok(Self {
             process,
             native_id,
-            cancel_seconds: context.config.runtime.cancel_timeout_seconds,
+            cancel_seconds: context.options.runtime.cancel_timeout_seconds,
             message_count: 0,
         })
     }

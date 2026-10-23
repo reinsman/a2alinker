@@ -1,6 +1,8 @@
 /target/
 /data/
 /.a2alinker/
+/docs/
+.DS_Store
 .env
 *.db
 *.db-shm

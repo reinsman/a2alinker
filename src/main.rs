@@ -1,4 +1,6 @@
-//! 程序启动入口。这里只初始化日志、解析参数，再把具体工作交给 `cli` 模块。
+//! 二进制只处理日志、参数和进程信号；服务由 a2alinker 库提供。
+
+mod cli;
 
 use clap::Parser;
 
@@ -13,6 +15,20 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "a2alinker=info".into()),
         )
         .init();
-    // parse() 来自 clap::Parser；await 等待命令执行结束，Result 将错误交给运行环境输出。
-    a2alinker::cli::execute(a2alinker::cli::Cli::parse()).await
+    let options = cli::Cli::parse().into_options()?;
+    a2alinker::Server::bind(options).await?.run(signal()).await
+}
+
+async fn signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

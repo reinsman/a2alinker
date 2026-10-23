@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::config::Config;
+use crate::options::Options;
 
 /// 一个技能包的入口和内容摘要；path 指向包内的 SKILL.md。
 #[derive(Debug, Clone, Serialize)]
@@ -36,10 +36,10 @@ struct Frontmatter {
 
 impl SkillSet {
     /// 借用配置，只读取源目录；按名称排序后计算摘要，使扫描结果稳定。
-    pub fn discover(config: &Config) -> Result<Self> {
+    pub fn discover(options: &Options) -> Result<Self> {
         let mut found = BTreeMap::<String, Skill>::new();
         let mut visited = HashSet::new();
-        for root in &config.skills.directories {
+        for root in &options.skills.directories {
             for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
                 let entry = entry?;
                 if entry.file_name() != "SKILL.md" || !entry.file_type().is_file() {
@@ -91,22 +91,15 @@ impl SkillSet {
                 );
             }
         }
-        for name in &config.skills.enabled {
+        for name in &options.skills.enabled {
             ensure!(found.contains_key(name), "enabled skill not found: {name}");
         }
         let skills: Vec<_> = found
             .into_values()
-            .filter(|s| config.skills.enabled.is_empty() || config.skills.enabled.contains(&s.name))
+            .filter(|s| {
+                options.skills.enabled.is_empty() || options.skills.enabled.contains(&s.name)
+            })
             .collect();
-        for capability in &config.capabilities {
-            for name in &capability.required_skills {
-                ensure!(
-                    skills.iter().any(|s| &s.name == name),
-                    "capability {} requires unavailable skill {name}",
-                    capability.id
-                );
-            }
-        }
         let mut digest = Sha256::new();
         for s in &skills {
             digest.update(s.name.as_bytes());
@@ -122,6 +115,10 @@ impl SkillSet {
     /// 取得 self 的所有权，把路径改成存储目录中的副本后返回新的技能集合。
     /// 源技能不会被修改；临时目录复制完成后才重命名为正式目录。
     pub fn snapshot(mut self, storage: &Path) -> Result<Self> {
+        // 原生技能模式没有网关管理的包，不创建或注入一个空的 extraRoots 目录。
+        if self.skills.is_empty() {
+            return Ok(self);
+        }
         let root = storage.join("skills").join(&self.digest);
         if !root.exists() {
             std::fs::create_dir_all(storage.join("skills"))?;

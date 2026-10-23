@@ -9,7 +9,7 @@ use std::{
 
 use a2alinker::{
     a2a,
-    config::{AgentKind, Config},
+    options::{AgentKind, Options},
     runtime::Gateway,
 };
 use axum::{Router, body::Body, http::Request, response::Response};
@@ -73,10 +73,7 @@ async fn learning_logs_explain_lifecycle_dedup_interaction_and_disconnect_withou
     )
     .unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let mut cfg = Config {
-        schema_version: 1,
-        ..Config::default()
-    };
+    let mut cfg = Options::default();
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent.executable =
         Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_agent.py"));

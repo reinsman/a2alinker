@@ -40,14 +40,14 @@ pub struct JsonlProcess {
 impl JsonlProcess {
     /// 启动进程并创建管道读取任务。返回 Result，启动失败时由 ? 向上层返回错误。
     pub fn spawn(context: &AdapterContext, args: &[String]) -> Result<Self> {
-        let mut cmd = Command::new(context.config.executable());
+        let mut cmd = Command::new(context.options.executable());
         cmd.args(args)
-            .current_dir(&context.config.agent.workspace)
-            .envs(&context.config.agent.env)
+            .current_dir(&context.options.agent.workspace)
+            .envs(&context.options.agent.env)
             .env(
-                match context.config.agent.kind {
-                    crate::config::AgentKind::Pi => "PI_CODING_AGENT_DIR",
-                    crate::config::AgentKind::Codex => "CODEX_HOME",
+                match context.options.agent.kind {
+                    crate::options::AgentKind::Pi => "PI_CODING_AGENT_DIR",
+                    crate::options::AgentKind::Codex => "CODEX_HOME",
                 },
                 &context.home,
             )
@@ -60,8 +60,8 @@ impl JsonlProcess {
         cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| {
             format!(
-                "cannot spawn agent executable '{}'; check agent.executable, agent.env.PATH and the script interpreter (nvm setup: docs/agent-launch.md)",
-                context.config.executable().display()
+                "cannot spawn agent executable '{}'; check --executable, PATH and the script interpreter (see README.md)",
+                context.options.executable().display()
             )
         })?;
         let group_id = child.id();
@@ -71,7 +71,7 @@ impl JsonlProcess {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let (tx, incoming) = mpsc::channel(128);
-        let limit = context.config.runtime.max_protocol_record_bytes;
+        let limit = context.options.runtime.max_protocol_record_bytes;
         // async move 将管道和发送端的所有权移入后台任务；这里只按换行切分 JSONL。
         let stdout_reader = tokio::spawn(async move {
             let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(limit));

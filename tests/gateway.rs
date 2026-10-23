@@ -9,7 +9,7 @@ use std::{
 
 use a2alinker::{
     a2a,
-    config::{AgentKind, Config},
+    options::{AgentKind, Options},
     runtime::{Gateway, INTERACTION_EXTENSION},
     storage::Store,
 };
@@ -28,11 +28,8 @@ fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_agent.py")
 }
 
-fn config(temp: &TempDir, kind: AgentKind) -> Config {
-    let mut cfg = Config {
-        schema_version: 1,
-        ..Config::default()
-    };
+fn options(temp: &TempDir, kind: AgentKind) -> Options {
+    let mut cfg = Options::default();
     cfg.agent.kind = kind;
     cfg.agent.executable = Some(fixture());
     cfg.agent.workspace = temp.path().into();
@@ -40,6 +37,10 @@ fn config(temp: &TempDir, kind: AgentKind) -> Config {
     cfg.agent.env.insert(
         "PI_CODING_AGENT_DIR".into(),
         temp.path().join("user-pi").display().to_string(),
+    );
+    cfg.agent.env.insert(
+        "CODEX_HOME".into(),
+        temp.path().join("user-codex").display().to_string(),
     );
     cfg.storage.directory = temp.path().join("data");
     cfg.runtime.startup_timeout_seconds = 5;
@@ -49,7 +50,7 @@ fn config(temp: &TempDir, kind: AgentKind) -> Config {
 }
 
 async fn gateway(temp: &TempDir, kind: AgentKind) -> Arc<Gateway> {
-    Gateway::open(config(temp, kind)).await.unwrap()
+    Gateway::open(options(temp, kind)).await.unwrap()
 }
 
 async fn rpc(router: &Router, method: &str, params: Value) -> Value {
@@ -86,6 +87,17 @@ async fn both_adapters_complete_without_duplicating_streamed_text() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
         let temp = tempfile::tempdir().unwrap();
         let g = gateway(&temp, kind).await;
+        // 两种 agent 都能在未声明具体能力、未选择本地技能包时正常执行任务。
+        let card = serde_json::to_value(a2a::agent_card(&g)).unwrap();
+        assert_eq!(card["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(card["skills"][0]["id"], "dummy");
+        assert!(
+            !card["skills"][0]["description"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!card["skills"][0]["tags"].as_array().unwrap().is_empty());
         let task = complete(&g, Message::user_text("hello")).await;
         assert_eq!(task.status.state, TaskState::Completed, "{:?}", task.status);
         assert_eq!(task.artifacts.len(), 1);
@@ -104,7 +116,7 @@ async fn both_adapters_complete_without_duplicating_streamed_text() {
 #[tokio::test]
 async fn pi_execution_stream_preserves_reasoning_tools_arguments_results_and_snapshots() {
     let temp = tempfile::tempdir().unwrap();
-    let cfg = config(&temp, AgentKind::Pi);
+    let cfg = options(&temp, AgentKind::Pi);
     let g = Gateway::open(cfg.clone()).await.unwrap();
     let router = a2a::router(g.clone()).unwrap();
     let card = serde_json::to_value(a2a::agent_card(&g)).unwrap();
@@ -244,7 +256,7 @@ async fn pi_execution_stream_preserves_reasoning_tools_arguments_results_and_sna
 async fn pi_execution_forwarding_switches_filter_stream_and_storage_independently() {
     for (reasoning, tools) in [(false, false), (false, true), (true, false)] {
         let temp = tempfile::tempdir().unwrap();
-        let mut cfg = config(&temp, AgentKind::Pi);
+        let mut cfg = options(&temp, AgentKind::Pi);
         cfg.runtime.forward_reasoning = reasoning;
         cfg.runtime.forward_tools = tools;
         let g = Gateway::open(cfg).await.unwrap();
@@ -346,7 +358,7 @@ async fn pi_running_tool_snapshot_survives_sse_reconnect_and_disconnect() {
 async fn pi_execution_content_counts_toward_output_limit_and_releases_session() {
     for prompt in ["reasoning-large", "arguments-large", "tool-large"] {
         let temp = tempfile::tempdir().unwrap();
-        let mut cfg = config(&temp, AgentKind::Pi);
+        let mut cfg = options(&temp, AgentKind::Pi);
         cfg.runtime.max_output_bytes = 1024;
         let g = Gateway::open(cfg).await.unwrap();
         let failed = complete(&g, Message::user_text(prompt)).await;
@@ -381,7 +393,7 @@ async fn pi_execution_content_counts_toward_output_limit_and_releases_session() 
 async fn persistence_and_native_session_resume_survive_restart() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
         let temp = tempfile::tempdir().unwrap();
-        let cfg = config(&temp, kind);
+        let cfg = options(&temp, kind);
         let g = Gateway::open(cfg.clone()).await.unwrap();
         let task = complete(&g, Message::user_text("hello")).await;
         g.shutdown().await;
@@ -536,7 +548,7 @@ async fn task_failures_crashes_and_bad_frames_do_not_poison_next_tasks() {
 #[tokio::test]
 async fn timeout_also_interrupts_an_unacknowledged_command() {
     let temp = tempfile::tempdir().unwrap();
-    let mut cfg = config(&temp, AgentKind::Codex);
+    let mut cfg = options(&temp, AgentKind::Codex);
     cfg.runtime.task_timeout_seconds = 1;
     let g = Gateway::open(cfg).await.unwrap();
     let task = complete(&g, Message::user_text("hang-ack")).await;
@@ -555,7 +567,7 @@ async fn timeout_also_interrupts_an_unacknowledged_command() {
 #[tokio::test]
 async fn output_limit_fails_the_task_and_releases_the_session() {
     let temp = tempfile::tempdir().unwrap();
-    let mut cfg = config(&temp, AgentKind::Pi);
+    let mut cfg = options(&temp, AgentKind::Pi);
     cfg.runtime.max_output_bytes = 1024;
     let g = Gateway::open(cfg).await.unwrap();
     let failed = complete(&g, Message::user_text("large")).await;
@@ -658,8 +670,10 @@ async fn subscriptions_start_with_an_atomic_snapshot_even_with_a_cursor() {
 #[tokio::test]
 async fn restart_marks_unfinished_tasks_failed_without_replaying_them() {
     let temp = tempfile::tempdir().unwrap();
-    let cfg = config(&temp, AgentKind::Codex);
-    let store = Store::open(&cfg.storage.directory).await.unwrap();
+    let cfg = options(&temp, AgentKind::Codex);
+    let store = Store::open(&cfg.instance_directory().unwrap())
+        .await
+        .unwrap();
     let mut task = Task::new("unfinished", "context");
     task.status.state = TaskState::Working;
     store
@@ -727,12 +741,16 @@ async fn malformed_and_unsupported_requests_have_explicit_errors() {
 async fn selected_skills_are_loaded_by_each_adapter_before_accepting_tasks() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
         let temp = tempfile::tempdir().unwrap();
-        let mut cfg = config(&temp, kind);
+        let mut cfg = options(&temp, kind);
         cfg.skills.directories =
-            vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/skills")];
+            vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skills")];
         cfg.skills.enabled = vec!["code-review".into()];
         let g = Gateway::open(cfg).await.unwrap();
         assert_eq!(g.skills.skills.len(), 1);
+        // Card 的占位声明不受已加载 SKILL.md 影响，也不会阻止技能加载与任务执行。
+        let card = serde_json::to_value(a2a::agent_card(&g)).unwrap();
+        assert_eq!(card["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(card["skills"][0]["id"], "dummy");
         let task = complete(&g, Message::user_text("hello")).await;
         assert_eq!(task.status.state, TaskState::Completed);
         g.shutdown().await;
@@ -740,10 +758,67 @@ async fn selected_skills_are_loaded_by_each_adapter_before_accepting_tasks() {
 }
 
 #[tokio::test]
+async fn native_skills_are_inherited_without_overwriting_disabled_skills() {
+    for kind in [AgentKind::Pi, AgentKind::Codex] {
+        for inherit in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut cfg = options(&temp, kind);
+            cfg.skills.inherit_user = inherit;
+            let user = temp.path().join(if kind == AgentKind::Pi {
+                "user-pi"
+            } else {
+                "user-codex"
+            });
+            for (name, enabled) in [("native-on", true), ("native-off", false)] {
+                let directory = user.join("skills").join(name);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("SKILL.md"), format!("---\nname: {name}\ndescription: Native fixture skill\nenabled: {enabled}\n---\nNative skill\n")).unwrap();
+            }
+            let trace = temp.path().join("trace.jsonl");
+            cfg.agent
+                .env
+                .insert("A2ALINKER_TEST_TRACE".into(), trace.display().to_string());
+            let g = Gateway::open(cfg).await.unwrap();
+            let task = complete(&g, Message::user_text("hello")).await;
+            assert_eq!(task.status.state, TaskState::Completed);
+            g.shutdown().await;
+            let records: Vec<Value> = std::fs::read_to_string(trace)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if kind == AgentKind::Pi {
+                let starts: Vec<_> = records
+                    .iter()
+                    .filter_map(|record| record["startup"]["args"].as_array())
+                    .collect();
+                assert!(!starts.is_empty());
+                for args in starts {
+                    assert_eq!(args.iter().any(|arg| arg == "--no-skills"), !inherit);
+                    assert!(!args.iter().any(|arg| arg == "--skill"));
+                }
+            } else {
+                assert!(
+                    !records
+                        .iter()
+                        .any(|record| record["request"]["method"] == "skills/extraRoots/set")
+                );
+                assert!(
+                    !records
+                        .iter()
+                        .any(|record| record["request"]["method"] == "skills/config/write"),
+                    "native mode must preserve original enabled and disabled states"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn evicted_sessions_resume_and_configuration_changes_require_a_new_context() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
         let temp = tempfile::tempdir().unwrap();
-        let mut cfg = config(&temp, kind);
+        let mut cfg = options(&temp, kind);
         cfg.runtime.max_sessions = 1;
         let g = Gateway::open(cfg.clone()).await.unwrap();
         let first = complete(&g, Message::user_text("hello")).await;
@@ -776,7 +851,7 @@ async fn evicted_sessions_resume_and_configuration_changes_require_a_new_context
 #[tokio::test]
 async fn bounded_queue_rejects_overflow_without_persisting_a_phantom_task() {
     let temp = tempfile::tempdir().unwrap();
-    let mut cfg = config(&temp, AgentKind::Codex);
+    let mut cfg = options(&temp, AgentKind::Codex);
     cfg.runtime.queue_capacity = 1;
     let g = Gateway::open(cfg).await.unwrap();
     let running = g.submit(Message::user_text("slow")).await.unwrap();
@@ -805,7 +880,7 @@ async fn process_group_cleanup_kills_tools_even_after_agent_process_exits() {
     };
 
     let temp = tempfile::tempdir().unwrap();
-    let mut cfg = config(&temp, AgentKind::Pi);
+    let mut cfg = options(&temp, AgentKind::Pi);
     let pid_file = temp.path().join("child.pid");
     cfg.agent.env.insert(
         "A2ALINKER_TEST_CHILD_PID".into(),

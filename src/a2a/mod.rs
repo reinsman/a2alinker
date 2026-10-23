@@ -28,7 +28,7 @@ use tracing::Instrument;
 
 use crate::{
     adapters::execution::EXECUTION_EXTENSION,
-    config::AuthMode,
+    options::AuthMode,
     runtime::{ApiError, ApiResult, Gateway, INTERACTION_EXTENSION, trim_history},
 };
 
@@ -40,8 +40,8 @@ struct App {
 
 /// 构建共享同一网关的路由；App 的 Clone 只克隆 Arc 等轻量句柄。
 pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
-    let token_hash = if gateway.config.auth.mode == AuthMode::Bearer {
-        let token = std::env::var(&gateway.config.auth.token_env)
+    let token_hash = if gateway.options.auth.mode == AuthMode::Bearer {
+        let token = std::env::var(&gateway.options.auth.token_env)
             .context("bearer token environment variable is not set")?;
         ensure!(
             token.len() >= 32,
@@ -51,7 +51,7 @@ pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
     } else {
         None
     };
-    let limit = gateway.config.server.max_request_bytes;
+    let limit = gateway.options.server.max_request_bytes;
     Ok(Router::new()
         .route("/.well-known/agent-card.json", get(card))
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
@@ -64,7 +64,7 @@ pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
 }
 
 pub fn agent_card(gateway: &Gateway) -> AgentCard {
-    let cfg = &gateway.config;
+    let cfg = &gateway.options;
     let mut card = AgentCard::new(
         &cfg.identity.name,
         &cfg.identity.description,
@@ -79,18 +79,16 @@ pub fn agent_card(gateway: &Gateway) -> AgentCard {
     card.capabilities.extended_agent_card = Some(false);
     card.capabilities.extensions = vec![AgentExtension {
         uri: INTERACTION_EXTENSION.into(),
-        description: Some("Structured input and approval replies; see docs/interaction.md".into()),
+        description: Some("Structured input and approval replies".into()),
         required: false,
         params: None,
     }];
-    if cfg.agent.kind == crate::config::AgentKind::Pi
+    if cfg.agent.kind == crate::options::AgentKind::Pi
         && (cfg.runtime.forward_reasoning || cfg.runtime.forward_tools)
     {
         card.capabilities.extensions.push(AgentExtension {
             uri: EXECUTION_EXTENSION.into(),
-            description: Some(
-                "Public reasoning and structured tool execution; see docs/execution.md".into(),
-            ),
+            description: Some("Public reasoning and structured tool execution".into()),
             required: false,
             params: Some(HashMap::from([
                 ("reasoning".into(), json!(cfg.runtime.forward_reasoning)),
@@ -99,14 +97,13 @@ pub fn agent_card(gateway: &Gateway) -> AgentCard {
         });
     }
     card.default_input_modes = vec!["text/plain".into(), "application/json".into()];
-    card.skills = cfg
-        .capabilities
-        .iter()
-        .map(|c| {
-            AgentSkill::new(&c.id, &c.name, &c.description, c.tags.clone())
-                .with_examples(c.examples.clone())
-        })
-        .collect();
+    // A2A 要求至少一项能力声明；占位项表示未声明具体能力，不代表没有本地技能。
+    card.skills = vec![AgentSkill::new(
+        "dummy",
+        "未声明具体能力",
+        "此 Agent 未提供具体能力清单，请通过消息询问。",
+        vec!["unspecified".into()],
+    )];
     if cfg.auth.mode == AuthMode::Bearer {
         card.security_schemes.insert(
             "bearer".into(),
@@ -120,14 +117,15 @@ pub fn agent_card(gateway: &Gateway) -> AgentCard {
 }
 
 async fn card(State(app): State<App>) -> Response {
+    let card = agent_card(&app.gateway);
     tracing::info!(
         event = "a2a.discovery",
         protocol_version = "1.0",
-        agent = app.gateway.config.agent.kind.as_str(),
-        skill_count = app.gateway.config.capabilities.len(),
+        agent = app.gateway.options.agent.kind.as_str(),
+        skill_count = card.skills.len(),
         "客户端读取 Agent Card：发现服务能力、协议和认证要求"
     );
-    let mut response = Json(agent_card(&app.gateway)).into_response();
+    let mut response = Json(card).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=60"),
@@ -288,16 +286,16 @@ async fn dispatch(
                 }
             }
             let request: SendMessageRequest = parse(params)?;
-            let config = request.configuration.unwrap_or_default();
-            history_length(config.history_length)?;
-            if config.task_push_notification_config.is_some() {
+            let options = request.configuration.unwrap_or_default();
+            history_length(options.history_length)?;
+            if options.task_push_notification_config.is_some() {
                 return Err(ApiError {
                     code: -32003,
                     message: "Push notifications are not supported".into(),
                 });
             }
-            if !config.accepted_output_modes.is_empty()
-                && !config
+            if !options.accepted_output_modes.is_empty()
+                && !options
                     .accepted_output_modes
                     .iter()
                     .any(|m| m == "text/plain")
@@ -321,16 +319,16 @@ async fn dispatch(
                     id.clone(),
                     task.id.to_string(),
                     None,
-                    config.history_length,
+                    options.history_length,
                 )
                 .await;
             }
-            let mut task = if config.return_immediately {
+            let mut task = if options.return_immediately {
                 task
             } else {
                 gateway.wait(task.id.as_str(), true).await?
             };
-            trim_history(&mut task, config.history_length);
+            trim_history(&mut task, options.history_length);
             Ok(success(id, json!({"task":task})))
         }
         "GetTask" => {

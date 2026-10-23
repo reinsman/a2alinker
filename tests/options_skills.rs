@@ -1,21 +1,21 @@
-//! 配置和技能的文件系统测试：用临时目录验证路径、摘要、筛选和非法输入。
+//! 运行选项和技能的文件系统测试：用临时目录验证路径、摘要、筛选和非法输入。
 //! 测试中的 unwrap 使意外错误直接导致用例失败，便于定位与报告。
 
 use std::path::{Path, PathBuf};
 
 use a2alinker::{
     adapters,
-    cli::{Cli, Command},
-    config::{AgentKind, AuthMode, Config},
+    options::{AgentKind, AuthMode, Options},
     skills::SkillSet,
 };
-use clap::Parser;
 
-fn config(root: &Path) -> Config {
-    let mut cfg = Config {
-        schema_version: 1,
-        ..Config::default()
-    };
+fn options(root: &Path) -> Options {
+    let mut cfg = Options::default();
+    cfg.agent.kind = AgentKind::Codex;
+    cfg.agent.env.insert(
+        "CODEX_HOME".into(),
+        root.join("user-codex").display().to_string(),
+    );
     cfg.agent.workspace = root.into();
     cfg.storage.directory = root.join("data");
     cfg
@@ -32,48 +32,40 @@ fn skill(root: &Path, name: &str) {
 }
 
 #[test]
-fn file_paths_are_relative_to_config_and_cli_paths_to_current_directory() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(temp.path().join("deploy")).unwrap();
-    let path = temp.path().join("deploy/config.toml");
-    std::fs::write(&path, "schema_version = 1\n[agent]\nkind = 'pi'\nworkspace = '..'\n[storage]\ndirectory = '../state'\n").unwrap();
-    let cfg = Config::load(Some(&path)).unwrap();
+fn defaults_match_native_pi_and_paths_resolve_against_the_current_process() {
+    let mut cfg = Options::default();
     assert_eq!(cfg.agent.kind, AgentKind::Pi);
+    assert_eq!(cfg.identity.name, "Alan");
+    assert_eq!(cfg.server.listen, "127.0.0.1:10100".parse().unwrap());
+    assert_eq!(cfg.storage.directory, PathBuf::from("~/.rein/storage"));
+    assert!(cfg.skills.inherit_user);
+    assert!(cfg.agent.allow_extensions);
+    assert!(cfg.agent.sandbox.is_none());
+    assert!(cfg.agent.approval_policy.is_none());
+    cfg.agent.workspace = ".".into();
+    cfg.storage.directory = "state".into();
+    cfg.resolve().unwrap();
     assert_eq!(
         cfg.agent.workspace.canonicalize().unwrap(),
-        temp.path().canonicalize().unwrap()
+        std::env::current_dir().unwrap()
     );
-    assert_eq!(cfg.storage.directory, temp.path().join("deploy/../state"));
-    let cli = Cli::try_parse_from([
-        "a2alinker",
-        "serve",
-        "--config",
-        path.to_str().unwrap(),
-        "--agent",
-        "codex",
-        "--workspace",
-        ".",
-    ])
-    .unwrap();
-    let Command::Serve(args) = cli.command else {
-        panic!()
-    };
-    let cfg = args.resolve().unwrap();
-    assert_eq!(cfg.agent.kind, AgentKind::Codex);
     assert_eq!(
-        cfg.agent.workspace,
-        std::env::current_dir().unwrap().join(".")
+        cfg.storage.directory,
+        std::env::current_dir().unwrap().join("state")
     );
+    for value in ["", " ", "  \t"] {
+        cfg.agent.executable = Some(value.into());
+        assert_eq!(cfg.executable(), PathBuf::from("pi"));
+    }
+    cfg.agent.kind = AgentKind::Codex;
+    assert_eq!(cfg.executable(), PathBuf::from("codex"));
 }
 
 #[test]
-fn configuration_rejects_typos_unsecured_listeners_and_unsupported_parallelism() {
+fn configuration_rejects_unsecured_listeners_and_unsupported_parallelism() {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("config.toml");
-    std::fs::write(&path, "schema_version = 1\n[agent]\nworkspce = '.'\n").unwrap();
-    assert!(Config::load(Some(&path)).is_err());
-    let mut cfg = config(temp.path());
-    cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
+    let mut cfg = options(temp.path());
+    cfg.server.listen = "0.0.0.0:10100".parse().unwrap();
     assert!(cfg.validate().is_err());
     cfg.auth.mode = AuthMode::Bearer;
     cfg.validate().unwrap();
@@ -82,11 +74,130 @@ fn configuration_rejects_typos_unsecured_listeners_and_unsupported_parallelism()
 }
 
 #[test]
+fn instance_storage_uses_the_name_without_mutating_the_shared_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = options(temp.path());
+    let root = cfg.storage.directory.clone();
+    cfg.resolve().unwrap();
+    cfg.resolve().unwrap();
+    assert_eq!(cfg.storage.directory, root);
+    assert_eq!(cfg.instance_directory().unwrap(), root.join("Alan"));
+    cfg.identity.name = "Bob".into();
+    assert_eq!(cfg.instance_directory().unwrap(), root.join("Bob"));
+    assert_eq!(cfg.storage.directory, root);
+    for name in [
+        "", " ", ".", "..", "../other", "a/b", "a\\b", "/tmp", "C:other", "a\0b",
+    ] {
+        cfg.identity.name = name.into();
+        assert!(cfg.validate().is_err(), "unsafe instance name: {name:?}");
+    }
+}
+
+#[test]
+fn native_skills_do_not_inject_an_empty_explicit_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = options(temp.path());
+    let snapshot = SkillSet::discover(&cfg)
+        .unwrap()
+        .snapshot(&cfg.storage.directory)
+        .unwrap();
+    assert!(snapshot.root.is_none());
+}
+
+#[test]
+fn codex_inherited_skills_preserve_default_native_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("user-codex");
+    std::fs::create_dir_all(&user).unwrap();
+    let source = user.join("config.toml");
+    let content = "[[skills.config]]\npath = '/example/disabled/SKILL.md'\nenabled = false\n";
+    std::fs::write(&source, content).unwrap();
+    let mut cfg = options(temp.path());
+    cfg.agent
+        .env
+        .insert("CODEX_HOME".into(), user.display().to_string());
+    cfg.agent.inherit_auth = false;
+    assert_eq!(cfg.effective_native_config().unwrap(), Some(source.clone()));
+    let fingerprint = cfg.fingerprint("").unwrap();
+    let home = adapters::prepare_home(&cfg, "").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.join("config.toml")).unwrap(),
+        content
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), content);
+    std::fs::write(&source, content.replace("false", "true")).unwrap();
+    assert_ne!(cfg.fingerprint("").unwrap(), fingerprint);
+    cfg.skills.inherit_user = false;
+    assert_eq!(cfg.effective_native_config().unwrap(), Some(source));
+    let explicit = temp.path().join("explicit.toml");
+    std::fs::write(&explicit, "").unwrap();
+    cfg.agent.native_config = Some(explicit.clone());
+    assert_eq!(cfg.effective_native_config().unwrap(), Some(explicit));
+}
+
+#[cfg(unix)]
+#[test]
+fn private_agent_home_links_native_skills_only_when_inheritance_is_enabled() {
+    for kind in [AgentKind::Pi, AgentKind::Codex] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("user-agent");
+        skill(&source.join("skills/native-review"), "native-review");
+        std::fs::create_dir_all(source.join("git")).unwrap();
+        std::fs::create_dir_all(source.join("npm")).unwrap();
+        for name in ["extensions", "prompts", "themes"] {
+            std::fs::create_dir_all(source.join(name)).unwrap();
+        }
+        std::fs::write(source.join("trust.json"), "{}").unwrap();
+        let mut cfg = options(temp.path());
+        cfg.agent.kind = kind;
+        cfg.agent.inherit_auth = false;
+        let env_key = if kind == AgentKind::Pi {
+            "PI_CODING_AGENT_DIR"
+        } else {
+            "CODEX_HOME"
+        };
+        cfg.agent
+            .env
+            .insert(env_key.into(), source.display().to_string());
+        let home = adapters::prepare_home(&cfg, "").unwrap();
+        assert!(
+            std::fs::symlink_metadata(home.join("skills"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            home.join("skills/native-review/SKILL.md")
+                .canonicalize()
+                .unwrap(),
+            source
+                .join("skills/native-review/SKILL.md")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(home.join("git").exists(), kind == AgentKind::Pi);
+        assert_eq!(home.join("npm").exists(), kind == AgentKind::Pi);
+        assert_eq!(home.join("trust.json").exists(), kind == AgentKind::Pi);
+        for name in ["extensions", "prompts", "themes"] {
+            assert_eq!(home.join(name).exists(), kind == AgentKind::Pi);
+        }
+        assert_eq!(adapters::prepare_home(&cfg, "").unwrap(), home);
+        cfg.skills.inherit_user = false;
+        let managed = adapters::prepare_home(&cfg, "").unwrap();
+        assert!(!managed.join("skills").exists());
+        assert_eq!(managed.join("git").exists(), kind == AgentKind::Pi);
+        cfg.agent.allow_extensions = false;
+        let restricted = adapters::prepare_home(&cfg, "").unwrap();
+        assert!(!restricted.join("extensions").exists());
+    }
+}
+
+#[test]
 fn skill_packages_are_snapshotted_with_supporting_files_and_detect_changes() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("skills/review");
     skill(&root, "review");
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.skills.directories.push(root.clone());
     let discovered = SkillSet::discover(&cfg).unwrap();
     let original_digest = discovered.digest.clone();
@@ -122,7 +233,7 @@ fn duplicate_and_missing_skills_are_rejected_and_names_filter_explicit_packages(
     let temp = tempfile::tempdir().unwrap();
     skill(&temp.path().join("a"), "review");
     skill(&temp.path().join("b"), "review");
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.skills.directories = vec![temp.path().join("a"), temp.path().join("b")];
     assert!(SkillSet::discover(&cfg).is_err());
     cfg.skills.directories.pop();
@@ -137,7 +248,7 @@ fn native_configuration_content_changes_session_fingerprint() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("config.toml");
     std::fs::write(&source, "model = 'first'\n").unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.native_config = Some(source.clone());
     let first = cfg.fingerprint("").unwrap();
     std::fs::write(source, "model = 'second'\n").unwrap();
@@ -158,7 +269,7 @@ fn pi_defaults_copy_user_settings_and_auth_and_track_content_changes() {
         r#"{"example":"test-credential"}"#,
     )
     .unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent
         .env
@@ -203,7 +314,7 @@ fn pi_custom_directory_and_explicit_native_config_have_defined_precedence() {
     std::fs::create_dir_all(&directory).unwrap();
     let default = directory.join("settings.json");
     std::fs::write(&default, r#"{"defaultModel":"from-directory"}"#).unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent.env.insert(
         "PI_CODING_AGENT_DIR".into(),
@@ -234,7 +345,7 @@ fn pi_custom_directory_and_explicit_native_config_have_defined_precedence() {
 fn pi_missing_default_settings_use_built_in_defaults_but_directories_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let directory = temp.path().join("pi-user");
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent.env.insert(
         "PI_CODING_AGENT_DIR".into(),
@@ -249,32 +360,17 @@ fn pi_missing_default_settings_use_built_in_defaults_but_directories_are_rejecte
 }
 
 #[test]
-fn pi_default_configuration_is_selected_after_cli_agent_override() {
+fn native_configuration_follows_the_selected_agent() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("settings.json");
     std::fs::write(&source, "{}").unwrap();
-    let path = temp.path().join("gateway.toml");
-    std::fs::write(
-        &path,
-        format!("schema_version = 1\n[agent]\nkind = 'codex'\nworkspace = '.'\n[agent.env]\nPI_CODING_AGENT_DIR = '{}'\n", temp.path().display()),
-    ).unwrap();
-    let cli = Cli::try_parse_from([
-        "a2alinker",
-        "config",
-        "validate",
-        "--config",
-        path.to_str().unwrap(),
-        "--agent",
-        "pi",
-    ])
-    .unwrap();
-    let Command::Config {
-        command: a2alinker::cli::ConfigCommand::Validate(args),
-    } = cli.command
-    else {
-        panic!()
-    };
-    let cfg = args.resolve().unwrap();
+    let mut cfg = options(temp.path());
+    cfg.agent.env.insert(
+        "PI_CODING_AGENT_DIR".into(),
+        temp.path().display().to_string(),
+    );
+    assert!(cfg.effective_native_config().unwrap().is_none());
+    cfg.agent.kind = AgentKind::Pi;
     assert_eq!(cfg.effective_native_config().unwrap(), Some(source));
 }
 
@@ -284,7 +380,7 @@ fn symlinks_inside_skill_packages_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     skill(&temp.path().join("skill"), "review");
     std::os::unix::fs::symlink("/etc", temp.path().join("skill/references")).unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.skills.directories.push(temp.path().join("skill"));
     assert!(SkillSet::discover(&cfg).is_err());
 }
@@ -298,7 +394,7 @@ fn pi_default_models_are_copied_hashed_and_keep_private_permissions() {
     let first =
         r#"{"providers":{"example":{"baseUrl":"https://first.invalid","apiKey":"test-token"}}}"#;
     std::fs::write(&models, first).unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent.inherit_auth = false;
     cfg.agent
@@ -345,7 +441,7 @@ fn pi_explicit_file_and_directory_configs_include_their_models() {
     let models = source.join("models.json");
     std::fs::write(&settings, r#"{"defaultProvider":"example"}"#).unwrap();
     std::fs::write(&models, r#"{"providers":{"example":{}}}"#).unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent.inherit_auth = false;
     cfg.agent.native_config = Some(settings);
@@ -369,7 +465,7 @@ fn pi_rejects_a_directory_in_place_of_models_json() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("pi-user");
     std::fs::create_dir_all(source.join("models.json")).unwrap();
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.agent.kind = AgentKind::Pi;
     cfg.agent
         .env
@@ -378,11 +474,13 @@ fn pi_rejects_a_directory_in_place_of_models_json() {
 }
 
 #[test]
-fn bundled_examples_validate_and_have_loadable_skills() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for example in ["pi.toml", "pi-nvm.toml", "codex.toml"] {
-        let cfg = Config::load(Some(&root.join("examples").join(example))).unwrap();
-        cfg.validate().unwrap();
+fn fixture_skill_package_is_available_to_both_adapters() {
+    let temp = tempfile::tempdir().unwrap();
+    for kind in [AgentKind::Pi, AgentKind::Codex] {
+        let mut cfg = options(temp.path());
+        cfg.agent.kind = kind;
+        cfg.skills.directories =
+            vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skills")];
         assert_eq!(SkillSet::discover(&cfg).unwrap().skills.len(), 1);
     }
 }
@@ -392,7 +490,7 @@ fn skill_snapshots_cannot_recursively_copy_their_own_storage_directory() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("skill");
     skill(&root, "review");
-    let mut cfg = config(temp.path());
+    let mut cfg = options(temp.path());
     cfg.skills.directories.push(root.clone());
     cfg.storage.directory = root.join("data");
     let discovered = SkillSet::discover(&cfg).unwrap();

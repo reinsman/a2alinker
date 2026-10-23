@@ -23,7 +23,7 @@ impl CodexSession {
     /// 完成初始化、技能白名单检查和 thread 创建/恢复；模型推理从 run 的 turn/start 开始。
     pub async fn start(context: &AdapterContext, native: Option<&str>) -> Result<Self> {
         let mut args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
-        args.extend(context.config.agent.args.clone());
+        args.extend(context.options.agent.args.clone());
         let mut process = JsonlProcess::spawn(context, &args)?;
         process
             .request(
@@ -47,7 +47,7 @@ impl CodexSession {
         let list = process
             .request(
                 "skills/list",
-                json!({"cwds":[context.config.agent.workspace],"forceReload":true}),
+                json!({"cwds":[context.options.agent.workspace],"forceReload":true}),
                 false,
             )
             .await?;
@@ -57,7 +57,7 @@ impl CodexSession {
             .iter()
             .map(|s| canonical(&s.path))
             .collect::<Result<_>>()?;
-        // 默认关闭未选中的技能；写入后重新查询，确认原生服务实际采用了该选择。
+        // 管理模式关闭未选中的技能；继承模式保留原生状态，不擅自启用用户禁用的包。
         let mut loaded = vec![];
         for entry in list["data"]
             .as_array()
@@ -75,7 +75,13 @@ impl CodexSession {
                 if selected {
                     loaded.push(path.to_string());
                 }
-                let enabled = selected || context.config.skills.inherit_user;
+                let enabled = if selected {
+                    true
+                } else if context.options.skills.inherit_user {
+                    continue;
+                } else {
+                    false
+                };
                 if skill["enabled"].as_bool() != Some(enabled) {
                     process
                         .request(
@@ -91,11 +97,11 @@ impl CodexSession {
             loaded.len() == expected.len(),
             "Codex did not discover every selected skill"
         );
-        if !expected.is_empty() || !context.config.skills.inherit_user {
+        if !expected.is_empty() || !context.options.skills.inherit_user {
             let refreshed = process
                 .request(
                     "skills/list",
-                    json!({"cwds":[context.config.agent.workspace],"forceReload":true}),
+                    json!({"cwds":[context.options.agent.workspace],"forceReload":true}),
                     false,
                 )
                 .await?;
@@ -119,16 +125,21 @@ impl CodexSession {
                 "Codex did not enable every selected skill"
             );
             ensure!(
-                context.config.skills.inherit_user || active.iter().all(|p| expected.contains(p)),
+                context.options.skills.inherit_user || active.iter().all(|p| expected.contains(p)),
                 "Codex did not disable inherited skills"
             );
         }
-        let mut params = json!({"cwd":canonical(&context.config.agent.workspace)?,
-            "sandbox":context.config.agent.sandbox,"approvalPolicy":context.config.agent.approval_policy});
-        if let Some(model) = &context.config.agent.model {
+        let mut params = json!({"cwd":canonical(&context.options.agent.workspace)?});
+        if let Some(sandbox) = &context.options.agent.sandbox {
+            params["sandbox"] = json!(sandbox);
+        }
+        if let Some(policy) = &context.options.agent.approval_policy {
+            params["approvalPolicy"] = json!(policy);
+        }
+        if let Some(model) = &context.options.agent.model {
             params["model"] = json!(model);
         }
-        if let Some(provider) = &context.config.agent.provider {
+        if let Some(provider) = &context.options.agent.provider {
             params["modelProvider"] = json!(provider);
         }
         let method = if let Some(id) = native {
@@ -145,7 +156,7 @@ impl CodexSession {
         Ok(Self {
             process,
             native_id,
-            cancel_seconds: context.config.runtime.cancel_timeout_seconds,
+            cancel_seconds: context.options.runtime.cancel_timeout_seconds,
         })
     }
 }
