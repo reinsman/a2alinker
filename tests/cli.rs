@@ -1,5 +1,5 @@
 //! 启动真实二进制，使用协议替身验证 CLI 默认值、原生继承和端口递增。
-#![cfg(unix)]
+#![cfg(all(unix, feature = "cli"))]
 
 use std::{
     fs::{self, File},
@@ -327,6 +327,38 @@ fn serve_uses_pi_current_workspace_native_skills_and_user_storage() {
         !trace.contains("--model"),
         "native model selection must be preserved"
     );
+}
+
+#[test]
+fn bearer_credentials_are_read_by_the_binary() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    let args = [
+        "--name",
+        "Alan",
+        "--desc",
+        "开发助手",
+        "--auth",
+        "bearer",
+        "--listen",
+        "0",
+    ];
+    let mut missing = Running::start(root, &args, &[]);
+    assert!(missing.failure().contains("A2ALINKER_TOKEN"));
+    assert!(!root.join("trace.jsonl").exists());
+    let mut server = Running::start(
+        root,
+        &args,
+        &[(
+            "A2ALINKER_TOKEN",
+            "binary-token-containing-at-least-32-bytes",
+        )],
+    );
+    let address = server.ready();
+    let card = http(address, "GET", "/.well-known/agent-card.json", "");
+    assert!(card["securitySchemes"]["bearer"].is_object());
+    server.stop();
 }
 
 #[test]

@@ -177,23 +177,84 @@ pi confirm 使用上述 `confirmed`；文本输入使用 `value` 或 `cancelled`
 
 ## 作为 Rust 库使用
 
-二进制只负责 clap 参数解析、日志和进程信号。`Server` 负责监听和 HTTP 生命周期，`runtime` 负责任务调度与恢复，`adapters` 负责原生进程和协议，`storage` 负责持久化。
+`src/lib.rs` 是库入口，公开 `Options`、`Server`、`ServerHandle` 等类型；`src/bin/a2alinker.rs` 是独立的二进制入口，`Args` 定义和解析命令行参数，再调用同一套库 API。`options.rs` 定义运行选项、默认值及校验，内部的 A2A 协议、执行器、适配器和存储模块不作为公开 API。
+
+```text
+src/
+├── lib.rs
+├── options.rs
+├── server.rs
+├── runtime.rs
+├── storage.rs
+├── a2a/
+├── adapters/
+└── bin/
+    └── a2alinker.rs
+```
+
+外部 Rust daemon 可以直接依赖库。关闭默认的 `cli` feature 后，不引入 clap 或日志订阅器，日志由宿主 daemon 配置：
+
+```toml
+[dependencies]
+a2alinker = { path = "../a2alinker", default-features = false }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+```
+
+同一个 Tokio 运行时可动态管理多个服务，无需启动 a2alinker 二进制：
 
 ```rust,no_run
-use a2alinker::{Options, Server};
+use std::collections::HashMap;
+use a2alinker::{AgentKind, Options, Server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let options = Options::default();
-    let server = Server::bind(options).await?;
-    println!("listening on {}", server.local_addr());
-    server.run(async {
-        let _ = tokio::signal::ctrl_c().await;
-    }).await
+    let mut instances = HashMap::new();
+    for (name, agent) in [("Alan", AgentKind::Pi), ("Bob", AgentKind::Codex)] {
+        let mut options = Options::default();
+        options.identity.name = name.into();
+        options.identity.description = format!("{name} 的编程助手");
+        options.agent.kind = agent;
+        // daemon 可为每个实例分别设置 workspace、prepare、模型、端口等选项。
+        let instance = Server::start(options).await?;
+        println!("{} listening on {}", instance.name(), instance.local_addr());
+        instances.insert(name.to_owned(), instance);
+    }
+    tokio::signal::ctrl_c().await?;
+    for instance in instances.values() {
+        instance.request_shutdown();
+    }
+    for (_, instance) in instances {
+        instance.shutdown().await?;
+    }
+    Ok(())
 }
 ```
 
-库不安装信号处理器，由调用方提供关闭 Future。`options.rs` 定义 `Options` 及各组运行选项，可以直接用 Rust 字段定制，不需要 CLI 或配置文件。
+`Server::start(options).await` 返回前完成路径及凭据校验、端口绑定和原生协议预检。每个实例有独立的目录锁、队列和会话；同一存储根目录内名字必须唯一。具体的模型账号和网络可用性仍由任务执行结果体现。
+
+`ServerHandle` 提供以下操作：
+
+| 方法 | 用途 |
+| --- | --- |
+| `name()` / `local_addr()` | 读取实例名字和实际监听地址 |
+| `is_finished()` | 查看服务后台任务是否已经退出 |
+| `request_shutdown()` | 发出关闭请求，不等待清理，可重复调用 |
+| `wait().await` | 等待服务退出及清理，取得运行结果；可以在 `select!` 中取消等待后再次等待 |
+| `shutdown().await` | 请求关闭并等待清理，消费句柄；返回后可用同名实例重启 |
+
+丢弃句柄会请求后台关闭，等待清理完成应使用 `shutdown().await` 或 `request_shutdown()` 后 `wait().await`，并保持宿主 Tokio 运行时运行。库不安装进程信号处理器，不初始化全局日志，不修改进程级环境变量；daemon 负责实例注册表、全局信号与管理接口。公开 API 的集成测试位于 `tests/server.rs`，内部协议和进程测试位于 `tests/internal/`。
+
+库的认证凭据直接通过选项传入，每个实例可以使用不同的 token：
+
+```rust
+use a2alinker::{AuthMode, Options};
+let mut options = Options::default();
+options.auth.mode = AuthMode::Bearer;
+options.auth.token = Some("replace-with-your-instance-token-at-least-32-bytes".into());
+```
+
+只有二进制入口读取 `A2ALINKER_TOKEN` 并转换为上述选项。库不会从环境变量寻找认证凭据，且序列化或 Debug 不输出 `AuthOptions.token`。CLI 默认启用，构建和启动命令保持 `cargo build --release --locked`、`a2alinker serve ...`；多个二进制可继续放在 `src/bin/`，用 `cargo run --bin a2alinker -- serve ...` 选择入口。
 
 ## 部署与验证
 
@@ -205,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+cargo test --all-targets --no-default-features --locked
 ```
 
 需要 Rust 1.88+，已安装的 pi / Codex，以及用于测试的 Python 3。集成测试使用独立子进程，不调用真实模型。本包使用 `unsafe_code = "forbid"`，不包含自身的 unsafe 实现。学习笔记保留在本地 `docs/`，不纳入 Git 跟踪。

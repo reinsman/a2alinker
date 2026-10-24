@@ -1,5 +1,7 @@
 //! 验证教学日志能串起真实协议流程，且不会记录消息、输出正文或环境凭据。
 
+use crate as a2alinker;
+
 use std::{
     io::Write,
     path::Path,
@@ -60,7 +62,7 @@ async fn body(response: Response) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn learning_logs_explain_lifecycle_dedup_interaction_and_disconnect_without_payloads() {
-    // 该集成测试二进制只有此用例，全局订阅器也能捕获 Tokio 后台 worker 的日志。
+    // 全局订阅器覆盖后台 worker；此测试只检查目标流程及敏感内容，不依赖日志数量。
     let writer = LogWriter(Arc::new(Mutex::new(Vec::new())));
     let captured = writer.clone();
     tracing::subscriber::set_global_default(

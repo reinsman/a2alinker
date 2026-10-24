@@ -1,10 +1,43 @@
-//! 二进制专用的参数解析；服务实现位于 lib 的 Server、runtime 和 adapters。
+//! 二进制入口：定义和解析命令行参数、初始化日志、处理进程信号，再调用库启动服务。
 
 use std::{net::SocketAddr, path::PathBuf};
 
 use a2alinker::{AgentKind, Options, options::AuthMode};
-use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+
+// 普通 Rust main 不能直接等待异步操作；此宏创建 Tokio 运行时来执行 async main。
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 日志使用 stderr，避免与命令的标准输出混在一起。RUST_LOG 可覆盖默认级别。
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "a2alinker=info".into()),
+        )
+        .init();
+    let options = Args::parse().into_options()?;
+    let mut server = a2alinker::Server::start(options).await?;
+    tokio::select! {
+        result = server.wait() => result,
+        _ = signal() => server.shutdown().await,
+    }
+}
+
+async fn signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -13,68 +46,68 @@ use clap::{Args, Parser, Subcommand};
     about = "将本地 pi 或 Codex 提供为 A2A 服务",
     arg_required_else_help = true
 )]
-pub struct Cli {
+struct Args {
     #[command(subcommand)]
-    pub command: Command,
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+enum Command {
     /// 启动服务；省略 AGENT 时默认使用 pi。
     Serve(Box<ServeArgs>),
 }
 
-#[derive(Debug, Args)]
-pub struct ServeArgs {
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
     /// Agent 类型；也可通过 --agent 指定。
     #[arg(value_enum, value_name = "AGENT")]
-    pub backend: Option<AgentKind>,
+    backend: Option<AgentKind>,
     /// Agent 类型，默认 pi；位置参数优先。
     #[arg(long, value_enum, env = "A2ALINKER_AGENT")]
-    pub agent: Option<AgentKind>,
+    agent: Option<AgentKind>,
     /// 必填的实例名字，也是 Agent Card 名字，例如 Alan、Bob。
     #[arg(long, env = "A2ALINKER_NAME")]
-    pub name: String,
+    name: String,
     /// Agent Card 描述；新实例必填，已有实例省略时沿用本地描述。
     #[arg(long, env = "A2ALINKER_DESC", value_parser = parse_description)]
-    pub desc: Option<String>,
+    desc: Option<String>,
     /// 可执行文件；省略或空白时从 PATH 查找 pi / codex。
     #[arg(long, env = "A2ALINKER_EXECUTABLE")]
-    pub executable: Option<PathBuf>,
+    executable: Option<PathBuf>,
     /// 每次启动原生进程前在同一个 Bash 中执行；可 source 环境脚本、切换 nvm、export 代理。
     #[arg(long, env = "A2ALINKER_PREPARE", hide_env_values = true)]
-    pub prepare: Option<String>,
+    prepare: Option<String>,
     /// 原生配置目录或标准文件 settings.json / config.toml；直接使用，不复制。
     #[arg(long, env = "A2ALINKER_AGENT_CONFIG")]
-    pub agent_config: Option<PathBuf>,
+    agent_config: Option<PathBuf>,
     /// 附加技能目录，可重复；直接加载源目录，省略时沿用原生发现规则。
     #[arg(long, env = "A2ALINKER_SKILL_DIRS", value_delimiter = ';')]
-    pub skill_dir: Vec<PathBuf>,
+    skill_dir: Vec<PathBuf>,
     /// Agent 工作目录，默认当前进程的工作目录。
     #[arg(long, env = "A2ALINKER_WORKSPACE", default_value = ".")]
-    pub workspace: PathBuf,
+    workspace: PathBuf,
     /// 端口或 IP:端口；占用时向上递增，端口 0 由系统分配。
     #[arg(long, env = "A2ALINKER_LISTEN", default_value = "10100", value_parser = parse_listen)]
-    pub listen: SocketAddr,
+    listen: SocketAddr,
     /// 对外公开的 HTTP(S) origin；省略时使用实际监听地址。
     #[arg(long, env = "A2ALINKER_PUBLIC_URL")]
-    pub public_url: Option<String>,
+    public_url: Option<String>,
     /// 共享存储根目录，实例数据保存在该目录下的 {name}/ 中。
     #[arg(long, env = "A2ALINKER_STORAGE_DIR", default_value = "~/.rein/storage")]
-    pub storage_dir: PathBuf,
+    storage_dir: PathBuf,
     /// 覆盖原生模型选择。
     #[arg(long, env = "A2ALINKER_MODEL")]
-    pub model: Option<String>,
+    model: Option<String>,
     /// 覆盖原生 provider 选择。
     #[arg(long, env = "A2ALINKER_PROVIDER")]
-    pub provider: Option<String>,
+    provider: Option<String>,
     /// A2A 认证方式；bearer 凭据通过 A2ALINKER_TOKEN 提供。
     #[arg(long, value_enum, env = "A2ALINKER_AUTH", default_value = "none")]
-    pub auth: AuthMode,
+    auth: AuthMode,
 }
 
-impl Cli {
-    pub fn into_options(self) -> Result<Options> {
+impl Args {
+    fn into_options(self) -> Result<Options> {
         let Command::Serve(args) = self.command;
         args.into_options()
     }
@@ -98,6 +131,12 @@ impl ServeArgs {
         options.server.public_url = self.public_url;
         options.storage.directory = self.storage_dir;
         options.auth.mode = self.auth;
+        if options.auth.mode == AuthMode::Bearer {
+            options.auth.token = Some(
+                std::env::var("A2ALINKER_TOKEN")
+                    .context("--auth bearer requires the A2ALINKER_TOKEN environment variable")?,
+            );
+        }
         if !self.skill_dir.is_empty() {
             options.skills.directories = self.skill_dir;
         }
@@ -137,15 +176,15 @@ mod tests {
             vec!["a2alinker", "help", "serve"],
         ] {
             assert_eq!(
-                Cli::try_parse_from(args).unwrap_err().kind(),
+                Args::try_parse_from(args).unwrap_err().kind(),
                 ErrorKind::DisplayHelp
             );
         }
         for command in ["doctor", "config", "skills", "agents"] {
-            assert!(Cli::try_parse_from(["a2alinker", command]).is_err());
+            assert!(Args::try_parse_from(["a2alinker", command]).is_err());
         }
-        assert!(Cli::try_parse_from(["a2alinker", "serve", "--config", "old.toml"]).is_err());
-        assert!(Cli::try_parse_from(["a2alinker", "serve", "other-agent"]).is_err());
+        assert!(Args::try_parse_from(["a2alinker", "serve", "--config", "old.toml"]).is_err());
+        assert!(Args::try_parse_from(["a2alinker", "serve", "other-agent"]).is_err());
     }
 
     #[test]
@@ -160,7 +199,7 @@ mod tests {
         ] {
             args.extend(["--name", "Alan"]);
             assert_eq!(
-                Cli::try_parse_from(args)
+                Args::try_parse_from(args)
                     .unwrap()
                     .into_options()
                     .unwrap()
@@ -174,14 +213,14 @@ mod tests {
     #[test]
     fn name_is_required_and_explicit_descriptions_must_not_be_blank() {
         assert_eq!(
-            Cli::try_parse_from(["a2alinker", "serve"])
+            Args::try_parse_from(["a2alinker", "serve"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::MissingRequiredArgument
         );
         for description in ["", " ", "\t"] {
             assert_eq!(
-                Cli::try_parse_from([
+                Args::try_parse_from([
                     "a2alinker",
                     "serve",
                     "--name",

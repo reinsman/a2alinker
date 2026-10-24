@@ -1,6 +1,8 @@
 //! 使用模拟 nvm 验证通用环境准备，不要求 CI 安装 nvm、Node.js 或真实 agent。
 #![cfg(unix)]
 
+use crate as a2alinker;
+
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},

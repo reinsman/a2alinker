@@ -100,6 +100,7 @@ pub async fn create_session(
 }
 
 /// 只运行 --version，附带启动超时；真实协议兼容性由后续 create_session 验证。
+#[cfg(test)]
 pub async fn probe(options: &Options) -> Result<String> {
     let mut command = launch::command(options)?;
     let child = command.arg("--version").spawn().with_context(|| {

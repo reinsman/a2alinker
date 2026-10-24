@@ -55,9 +55,26 @@ fn configuration_rejects_unsecured_listeners_and_unsupported_parallelism() {
     cfg.server.listen = "0.0.0.0:10100".parse().unwrap();
     assert!(cfg.validate().is_err());
     cfg.auth.mode = AuthMode::Bearer;
+    cfg.auth.token = Some("test-token-with-at-least-32-bytes-long".into());
     cfg.validate().unwrap();
     cfg.runtime.max_concurrent_tasks = 2;
     assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn bearer_credentials_are_explicit_validated_and_omitted_from_debug_and_serialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut options = options(temp.path());
+    options.auth.mode = AuthMode::Bearer;
+    for token in [None, Some(""), Some("too-short")] {
+        options.auth.token = token.map(str::to_owned);
+        assert!(options.validate().is_err());
+    }
+    let secret = "private-token-long-enough-for-bearer-auth";
+    options.auth.token = Some(secret.into());
+    options.validate().unwrap();
+    assert!(!format!("{options:?}").contains(secret));
+    assert!(!serde_json::to_string(&options).unwrap().contains(secret));
 }
 
 #[test]

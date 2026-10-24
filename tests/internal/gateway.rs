@@ -1,6 +1,8 @@
 //! 使用独立子进程测试完整任务生命周期，不依赖真实模型，也不消耗推理额度。
 //! 重点覆盖去重、会话恢复、交互回复、SSE 和异常情况下的资源清理。
 
+use crate as a2alinker;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,

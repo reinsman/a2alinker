@@ -8,10 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     #[default]
@@ -170,7 +170,8 @@ impl Default for StorageOptions {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
     #[default]
@@ -178,18 +179,21 @@ pub enum AuthMode {
     Bearer,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthOptions {
     pub mode: AuthMode,
-    pub token_env: String,
+    /// daemon 直接传入凭据；CLI 从环境变量读取。序列化和 Debug 不输出凭据。
+    #[serde(skip_serializing)]
+    pub token: Option<String>,
 }
-impl Default for AuthOptions {
-    fn default() -> Self {
-        Self {
-            mode: AuthMode::None,
-            token_env: "A2ALINKER_TOKEN".into(),
-        }
+impl std::fmt::Debug for AuthOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthOptions")
+            .field("mode", &self.mode)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
     }
 }
 
@@ -237,6 +241,15 @@ impl Options {
     /// 校验跨字段约束；ensure! 在条件不满足时直接返回错误。
     pub fn validate(&self) -> Result<()> {
         self.instance_directory()?;
+        if self.auth.mode == AuthMode::Bearer {
+            ensure!(
+                self.auth
+                    .token
+                    .as_ref()
+                    .is_some_and(|token| token.len() >= 32),
+                "bearer authentication requires a token containing at least 32 bytes"
+            );
+        }
         if let Some(prepare) = &self.agent.prepare {
             ensure!(!prepare.trim().is_empty(), "--prepare must not be blank");
             ensure!(

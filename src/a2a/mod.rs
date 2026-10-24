@@ -41,8 +41,12 @@ struct App {
 /// 构建共享同一网关的路由；App 的 Clone 只克隆 Arc 等轻量句柄。
 pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
     let token_hash = if gateway.options.auth.mode == AuthMode::Bearer {
-        let token = std::env::var(&gateway.options.auth.token_env)
-            .context("bearer token environment variable is not set")?;
+        let token = gateway
+            .options
+            .auth
+            .token
+            .as_deref()
+            .context("bearer token is not set in AuthOptions")?;
         ensure!(
             token.len() >= 32,
             "bearer token must contain at least 32 bytes"

@@ -318,6 +318,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn latest_event(&self, task_id: &str) -> Result<i64> {
         Ok(
             sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM events WHERE task_id=?")

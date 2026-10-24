@@ -1,26 +1,36 @@
-//! 库的 HTTP 服务入口：绑定可用端口、创建执行器，并按调用方提供的信号关闭。
+//! 库的服务生命周期：每次 start 创建独立实例，句柄负责请求关闭并等待清理。
 
-use std::{future::Future, io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 use crate::{Options, a2a, runtime::Gateway};
 
-pub struct Server {
-    listener: TcpListener,
-    router: Router,
-    gateway: Arc<Gateway>,
+/// A2A 服务入口；库不初始化日志、不安装信号处理器，也不修改进程级环境变量。
+pub struct Server;
+
+/// 一个运行实例的控制句柄。不同句柄有独立的监听端口、任务队列和实例目录锁。
+/// Drop 会请求后台关闭；需要确认进程和锁已释放时，必须 await shutdown 或 wait。
+#[must_use = "保留句柄管理实例；丢弃句柄会请求关闭服务"]
+#[derive(Debug)]
+pub struct ServerHandle {
+    name: String,
+    address: SocketAddr,
+    stop: CancellationToken,
+    task: Option<JoinHandle<Result<()>>>,
 }
 
 impl Server {
-    /// 端口占用时逐个递增；权限错误、非法地址等其他错误直接返回。
-    /// 启动时检查原生协议，但不会发送模型 prompt。
-    pub async fn bind(mut options: Options) -> Result<Self> {
+    /// 返回前完成参数校验、端口绑定和原生协议预检，不请求模型推理。
+    /// 端口占用时递增；同一个 Tokio 运行时可以启动多个独立实例。
+    pub async fn start(mut options: Options) -> Result<ServerHandle> {
         options.resolve()?;
         let listener = bind_available(options.server.listen).await?;
-        options.server.listen = listener.local_addr()?;
+        let address = listener.local_addr()?;
+        options.server.listen = address;
         let gateway = Gateway::open(options).await?;
         let router = match a2a::router(gateway.clone()) {
             Ok(router) => router,
@@ -29,49 +39,88 @@ impl Server {
                 return Err(error);
             }
         };
-        Ok(Self {
-            listener,
-            router,
-            gateway,
+        let name = gateway.options.identity.name.clone();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(serve(listener, router, gateway, stop.clone()));
+        Ok(ServerHandle {
+            name,
+            address,
+            stop,
+            task: Some(task),
         })
+    }
+}
+
+impl ServerHandle {
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.gateway.options.server.listen
+        self.address
     }
 
-    pub fn gateway(&self) -> &Arc<Gateway> {
-        &self.gateway
+    /// 表示服务后台任务已退出，不代表上游模型账号或网络是否可用。
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// 库不安装进程信号处理器；调用方决定何时关闭服务。
-    pub async fn run(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
-        let Self {
-            listener,
-            router,
-            gateway,
-        } = self;
-        let storage = gateway.options.instance_directory()?;
-        tracing::info!(listen = %gateway.options.server.listen, agent = gateway.options.agent.kind.as_str(), name = gateway.options.identity.name, workspace = %gateway.options.agent.workspace.display(), storage_root = %gateway.options.storage.directory.display(), storage = %storage.display(), "A2A server ready");
-        tracing::info!(
-            event = "a2a.endpoints",
-            discovery_url = format!(
-                "{}/.well-known/agent-card.json",
-                gateway.options.public_url()
-            ),
-            rpc_url = format!("{}/a2a", gateway.options.public_url()),
-            "GET Agent Card 发现能力，POST /a2a 提交消息；流式调用使用 SSE"
-        );
-        let stopping = gateway.clone();
-        let result = axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                stopping.shutdown().await;
-            })
-            .await;
-        gateway.shutdown().await;
-        result.context("A2A server failed")
+    /// 只发出关闭请求；可重复调用，不阻塞 daemon 的管理循环。
+    pub fn request_shutdown(&self) {
+        self.stop.cancel();
     }
+
+    /// 等待 HTTP 服务、任务 worker 和原生进程清理完成，返回后台运行结果。
+    /// 取消此等待不会丢失 JoinHandle，也不会停止服务，可继续等待或主动关闭。
+    pub async fn wait(&mut self) -> Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        let result = task.await.context("A2A service task failed");
+        self.task = None;
+        result?
+    }
+
+    /// 请求关闭并等待清理；返回后可用同一个名字重新启动实例。
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.request_shutdown();
+        self.wait().await
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+async fn serve(
+    listener: TcpListener,
+    router: Router,
+    gateway: Arc<Gateway>,
+    stop: CancellationToken,
+) -> Result<()> {
+    let storage = gateway.options.instance_directory()?;
+    tracing::info!(listen = %gateway.options.server.listen, agent = gateway.options.agent.kind.as_str(), name = gateway.options.identity.name, workspace = %gateway.options.agent.workspace.display(), storage_root = %gateway.options.storage.directory.display(), storage = %storage.display(), "A2A server ready");
+    tracing::info!(
+        event = "a2a.endpoints",
+        discovery_url = format!(
+            "{}/.well-known/agent-card.json",
+            gateway.options.public_url()
+        ),
+        rpc_url = format!("{}/a2a", gateway.options.public_url()),
+        "GET Agent Card 发现能力，POST /a2a 提交消息；流式调用使用 SSE"
+    );
+    let stopping = gateway.clone();
+    let result = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            stop.cancelled().await;
+            stopping.shutdown().await;
+        })
+        .await;
+    gateway.shutdown().await;
+    gateway.store.close().await;
+    result.context("A2A server failed")
 }
 
 async fn bind_available(mut address: SocketAddr) -> Result<TcpListener> {
