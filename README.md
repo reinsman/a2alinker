@@ -5,9 +5,9 @@
 ```bash
 cargo build --release --locked
 
-./target/release/a2alinker serve       # 默认 pi
-./target/release/a2alinker serve pi
-./target/release/a2alinker serve codex
+./target/release/a2alinker serve --name Alan --desc "项目开发助手"  # 默认 pi
+./target/release/a2alinker serve pi --name Alan --desc "项目开发助手"
+./target/release/a2alinker serve codex --name Bob --desc "代码审查助手"
 ./target/release/a2alinker serve --help
 ```
 
@@ -27,14 +27,15 @@ a2alinker serve codex \
 | 参数 | 默认值与行为 |
 | --- | --- |
 | `AGENT` / `--agent` | `pi`，支持 `pi`、`codex`；位置参数优先 |
-| `--name` | `Alan`，Agent Card 中的简短名字 |
-| `--desc` | `本地 pi 编程助手` 或 `本地 codex 编程助手` |
+| `--name` | 必填，无默认值；实例名字，也是 Agent Card 中的简短名字 |
+| `--desc` | 新实例必填；已有实例省略时沿用本地描述，显式填写时更新描述 |
 | `--workspace` | 当前进程的工作目录 |
 | `--storage-dir` | 共享根目录 `~/.rein/storage`，每个实例保存到其中的 `{name}/` |
 | `--listen` | `10100`，默认监听 `127.0.0.1`；支持 `IP:端口` |
 | `--executable` | 省略或空白时从 PATH 查找 `pi` / `codex`；填写时使用指定文件 |
-| `--skill-dir` | 对应 agent 的原生技能目录与发现规则；显式指定时只加载指定目录中的技能包，可重复 |
-| `--agent-config` | agent 原生配置文件或目录；省略时自动使用原生配置 |
+| `--prepare` | 可选的 Bash 环境准备命令，环境变量为 `A2ALINKER_PREPARE`；适用于 nvm、代理等 |
+| `--skill-dir` | 省略时沿用原生技能发现规则；显式指定时直接加载附加目录，可重复，不复制或禁用其他原生技能 |
+| `--agent-config` | 直接使用原生配置目录，或标准配置文件 `settings.json` / `config.toml` 的所在目录；省略时由 agent 自行发现 |
 | `--model` / `--provider` | 沿用原生配置，填写时覆盖 |
 | `--public-url` | 实际监听地址；反向代理部署时可以指定对外 origin |
 | `--auth` | `none`；非回环监听必须设置 `bearer` |
@@ -47,36 +48,65 @@ a2alinker serve codex \
 ~/.rein/storage/
 ├── Alan/
 │   ├── a2alinker.db
-│   ├── instance.lock
-│   ├── sessions/
-│   └── home/
+│   └── instance.lock
 └── Bob/
     ├── a2alinker.db
-    ├── instance.lock
-    └── home/
+    └── instance.lock
 ```
 
 不同名字可以共享根目录并同时启动，端口占用时自动递增。同一根目录内的同名实例使用相同目录锁，不能同时运行。重启时保留相同根目录和名字，即可读取该实例原有的任务与会话。名字必须是单个目录名，例如 Alan、Bob，不能包含路径分隔符或 `..` 路径。
 
+启动时会提示“新实例”或“本地已有实例”。实例的 agent 类型和描述保存在该目录的 `a2alinker.db` 的 `instance` 表中，不新增配置文件。同一个名字绑定一种 agent：例如 Alan 首次使用 Pi，之后用 Codex 启动 Alan 会报错，应使用原 agent 或换名。
+
+```bash
+# 首次创建必须提供名字和描述
+a2alinker serve pi --name Alan --desc "项目开发助手"
+# 再次启动可以省略描述
+a2alinker serve pi --name Alan
+```
+
+新实例缺少 `--desc`，或描述只有空白字符时，会直接报错。旧版本未保存描述，首次升级启动需补充一次 `--desc`；程序会核对旧任务和原生进程目录中的 agent 类型，发现不一致或无法确定类型时会报错，不会覆盖原有实例。
+
 每个参数还支持对应的环境变量，命令行优先；完整列表见 `serve --help`。例如：
 
 ```bash
-A2ALINKER_NAME=Alan A2ALINKER_WORKSPACE=/work/project a2alinker serve pi
+A2ALINKER_NAME=Alan A2ALINKER_DESC="项目开发助手" A2ALINKER_WORKSPACE=/work/project a2alinker serve pi
 ```
 
 ## 沿用本地 agent
 
-默认读取 pi 的 `PI_CODING_AGENT_DIR`（未设置时为 `~/.pi/agent`）或 Codex 的 `CODEX_HOME`（未设置时为 `~/.codex`）。默认技能目录分别为该目录下的 `skills/`；项目技能继续遵守 agent 原生的发现与信任规则。
+默认不覆盖 Pi 的 `PI_CODING_AGENT_DIR`、Codex 的 `CODEX_HOME`，也不探测、复制或改写原生配置、认证和技能文件。原生 agent 按自己的环境变量和默认规则读取配置；通常分别使用 `~/.pi/agent` 和 `~/.codex`。项目技能、扩展、发现与信任规则都交给 agent 管理。
 
-原生模型配置、认证、技能和 pi 扩展等资源会用于服务。配置和认证文件使用私有运行副本，原生资源通过目录链接访问。Codex 的沙箱与审批规则默认沿用其原生配置，审批请求通过 A2A 转发给客户端。库调用方可以显式覆盖执行策略。
+显式 `--agent-config` 会直接把指定目录作为原生配置目录。指定标准配置文件时使用其所在目录，不支持通过复制重命名来加载任意文件名；配套的认证、模型等文件继续按 agent 的目录规则读取。Codex 的沙箱与审批规则默认沿用原生配置，审批请求通过 A2A 转发给客户端。库调用方可以显式覆盖执行策略。
 
-显式 `--skill-dir` 会校验并复制完整技能包，再按 pi / Codex 的原生接口加载；不会把这些文件直接拼接进提示词。技能加载并不是文件权限隔离。
+显式 `--skill-dir` 只把原目录传给 Pi 的 `--skill` 或 Codex 的 `skills/extraRoots/set`，不生成技能快照，不改写技能启用和禁用设置。技能内容和格式由原生 agent 处理。技能加载并不是文件权限隔离。
 
-如果 pi 依赖 nvm，可以先在当前终端执行 `nvm use 24.20.0`，或指定仓库内的启动脚本：
+新 Pi 会话不指定 `--session`，由 Pi 选择原生保存位置，a2alinker 从 `get_state.sessionFile` 记录 `contextId` 到实际路径的映射；继续会话时按该路径恢复。Codex 使用原生 thread ID。a2alinker 不再创建实例私有的 `home/`、`skills/` 或 `sessions/` 目录。
+
+模型、技能及其他执行设置变化后，可以继续原 `contextId`；不再计算或校验配置指纹。新配置何时生效遵循原生 agent 的行为，重新启动服务可以让新创建或恢复的进程使用当前启动选项。数据库保留旧 `fingerprint` 列用于兼容已有数据，但不再用它拒绝续聊。
+
+旧版本生成的目录和会话文件不自动搬动、复制或删除。旧 Pi 会话继续按数据库中的原路径恢复；旧 Codex 会话若保存在原私有 home 中，需显式把 `--agent-config` 指向该目录，原生 agent 才能找到这些 thread。
+
+如果 agent 需要先切换 nvm 或设置代理，可使用 `--prepare`：
 
 ```bash
-A2ALINKER_NODE_VERSION=24.20.0 a2alinker serve pi --executable ./scripts/pi-nvm
+a2alinker serve pi --name Alan --desc "项目开发助手" \
+  --prepare 'source "$HOME/.nvm/nvm.sh" --no-use && nvm use --silent 24.20.0'
+
+a2alinker serve codex --name Bob --desc "代码审查助手" \
+  --prepare 'export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890'
+
+# 多个准备动作使用 && 连接；也可以 source 自己的环境脚本
+a2alinker serve pi --name Alan --prepare 'source /path/to/agent-env.sh'
 ```
+
+准备命令目前使用 Unix 的 `/bin/bash`，不自动读取 shell 启动文件；初始工作目录为 `--workspace`。每次创建原生进程时，先在 Bash 中执行准备命令，再通过 `exec` 启动 `--executable`（省略时为 `pi` / `codex`）。两者共享环境，因此需要用 `export` 导出变量；只是单独执行一个脚本，脚本内的环境修改不会传回当前 Bash，应使用 `source`。
+
+准备命令的非零退出状态会阻止 agent 启动，多步骤中需要失败即停止的操作请用 `&&` 连接。准备阶段不能读取协议 stdin，其输出不会混入 JSONL stdout，也不会原样写入日志。启动超时和进程组清理同样覆盖准备阶段。版本探测、启动预检和之后创建的新会话进程都会各自执行准备；复用现有会话时不会重复执行。
+
+`--prepare` 只改变原生子进程环境，不修改 a2alinker 或当前终端的环境，也不改变 a2alinker 在启动前发现原生配置文件的规则。只需代理时，也可以在启动 a2alinker 前设置 `HTTPS_PROXY` 等环境变量，子进程会继承。
+
+本地便捷启动可执行 `./run.sh`：默认名字为 Alan，工作目录为项目根目录，准备动作会加载 nvm 并执行 `nvm use node`。脚本使用已构建的 release 二进制，支持追加参数，例如 `./run.sh --name Bob --desc "代码审查助手" --listen 10101`。
 
 ## A2A 调用
 

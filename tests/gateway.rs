@@ -33,7 +33,6 @@ fn options(temp: &TempDir, kind: AgentKind) -> Options {
     cfg.agent.kind = kind;
     cfg.agent.executable = Some(fixture());
     cfg.agent.workspace = temp.path().into();
-    cfg.agent.inherit_auth = false;
     cfg.agent.env.insert(
         "PI_CODING_AGENT_DIR".into(),
         temp.path().join("user-pi").display().to_string(),
@@ -675,9 +674,10 @@ async fn restart_marks_unfinished_tasks_failed_without_replaying_them() {
         .await
         .unwrap();
     let mut task = Task::new("unfinished", "context");
+    a2alinker::storage::metadata(&mut task).insert("a2alinker".into(), json!({"agent":"codex"}));
     task.status.state = TaskState::Working;
     store
-        .insert_task(&task, "original-message", "digest", "config")
+        .insert_task(&task, "original-message", "digest")
         .await
         .unwrap();
     store.close().await;
@@ -744,9 +744,7 @@ async fn selected_skills_are_loaded_by_each_adapter_before_accepting_tasks() {
         let mut cfg = options(&temp, kind);
         cfg.skills.directories =
             vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skills")];
-        cfg.skills.enabled = vec!["code-review".into()];
         let g = Gateway::open(cfg).await.unwrap();
-        assert_eq!(g.skills.skills.len(), 1);
         // Card 的占位声明不受已加载 SKILL.md 影响，也不会阻止技能加载与任务执行。
         let card = serde_json::to_value(a2a::agent_card(&g)).unwrap();
         assert_eq!(card["skills"].as_array().unwrap().len(), 1);
@@ -758,64 +756,79 @@ async fn selected_skills_are_loaded_by_each_adapter_before_accepting_tasks() {
 }
 
 #[tokio::test]
-async fn native_skills_are_inherited_without_overwriting_disabled_skills() {
+async fn source_skills_and_native_configuration_are_not_copied_or_rewritten() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
-        for inherit in [true, false] {
-            let temp = tempfile::tempdir().unwrap();
-            let mut cfg = options(&temp, kind);
-            cfg.skills.inherit_user = inherit;
-            let user = temp.path().join(if kind == AgentKind::Pi {
-                "user-pi"
-            } else {
-                "user-codex"
-            });
-            for (name, enabled) in [("native-on", true), ("native-off", false)] {
-                let directory = user.join("skills").join(name);
-                std::fs::create_dir_all(&directory).unwrap();
-                std::fs::write(directory.join("SKILL.md"), format!("---\nname: {name}\ndescription: Native fixture skill\nenabled: {enabled}\n---\nNative skill\n")).unwrap();
-            }
-            let trace = temp.path().join("trace.jsonl");
-            cfg.agent
-                .env
-                .insert("A2ALINKER_TEST_TRACE".into(), trace.display().to_string());
-            let g = Gateway::open(cfg).await.unwrap();
-            let task = complete(&g, Message::user_text("hello")).await;
-            assert_eq!(task.status.state, TaskState::Completed);
-            g.shutdown().await;
-            let records: Vec<Value> = std::fs::read_to_string(trace)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            if kind == AgentKind::Pi {
-                let starts: Vec<_> = records
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = options(&temp, kind);
+        let source = temp.path().join("specified-native");
+        std::fs::create_dir_all(source.join("skills/native-off")).unwrap();
+        let filename = if kind == AgentKind::Pi {
+            "settings.json"
+        } else {
+            "config.toml"
+        };
+        let config = source.join(filename);
+        std::fs::write(&config, "original native configuration").unwrap();
+        std::fs::write(
+            source.join("skills/native-off/SKILL.md"),
+            "---\nname: native-off\ndescription: Native skill\nenabled: false\n---\nNative skill\n",
+        )
+        .unwrap();
+        cfg.agent.native_config = Some(config.clone());
+        cfg.skills.directories =
+            vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skills")];
+        let trace = temp.path().join("trace.jsonl");
+        cfg.agent
+            .env
+            .insert("A2ALINKER_TEST_TRACE".into(), trace.display().to_string());
+        let g = Gateway::open(cfg.clone()).await.unwrap();
+        assert_eq!(
+            complete(&g, Message::user_text("hello")).await.status.state,
+            TaskState::Completed
+        );
+        g.shutdown().await;
+        let records: Vec<Value> = std::fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for startup in records.iter().filter_map(|record| record.get("startup")) {
+            assert_eq!(Path::new(startup["configHome"].as_str().unwrap()), source);
+            assert!(
+                !startup["args"]
+                    .as_array()
+                    .unwrap()
                     .iter()
-                    .filter_map(|record| record["startup"]["args"].as_array())
-                    .collect();
-                assert!(!starts.is_empty());
-                for args in starts {
-                    assert_eq!(args.iter().any(|arg| arg == "--no-skills"), !inherit);
-                    assert!(!args.iter().any(|arg| arg == "--skill"));
-                }
-            } else {
-                assert!(
-                    !records
-                        .iter()
-                        .any(|record| record["request"]["method"] == "skills/extraRoots/set")
-                );
-                assert!(
-                    !records
-                        .iter()
-                        .any(|record| record["request"]["method"] == "skills/config/write"),
-                    "native mode must preserve original enabled and disabled states"
-                );
-            }
+                    .any(|arg| arg == "--no-skills")
+            );
+        }
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["request"]["method"] == "skills/config/write")
+        );
+        if kind == AgentKind::Codex {
+            let roots = records
+                .iter()
+                .find(|record| record["request"]["method"] == "skills/extraRoots/set")
+                .unwrap();
+            assert_eq!(
+                roots["request"]["params"]["extraRoots"][0],
+                cfg.skills.directories[0].to_str().unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(config).unwrap(),
+            "original native configuration"
+        );
+        for directory in ["home", "skills", "sessions"] {
+            assert!(!cfg.instance_directory().unwrap().join(directory).exists());
         }
     }
 }
 
 #[tokio::test]
-async fn evicted_sessions_resume_and_configuration_changes_require_a_new_context() {
+async fn evicted_sessions_resume_across_model_and_skill_changes() {
     for kind in [AgentKind::Pi, AgentKind::Codex] {
         let temp = tempfile::tempdir().unwrap();
         let mut cfg = options(&temp, kind);
@@ -832,18 +845,17 @@ async fn evicted_sessions_resume_and_configuration_changes_require_a_new_context
         g.shutdown().await;
         drop(g);
         cfg.agent.model = Some("different-model".into());
+        cfg.skills.directories =
+            vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skills")];
         let g = Gateway::open(cfg).await.unwrap();
-        assert_eq!(
-            g.submit(Message::user_text("hello").with_context_id(first.context_id.as_str()))
-                .await
-                .unwrap_err()
-                .code,
-            -32602
-        );
-        assert_eq!(
-            complete(&g, Message::user_text("hello")).await.status.state,
-            TaskState::Completed
-        );
+        let resumed = complete(
+            &g,
+            Message::user_text("hello").with_context_id(first.context_id.as_str()),
+        )
+        .await;
+        assert_eq!(resumed.context_id, first.context_id);
+        assert_eq!(resumed.status.state, TaskState::Completed);
+        assert_eq!(resumed.artifacts[0].parts[0].as_text(), Some("Hello 3"));
         g.shutdown().await;
     }
 }
@@ -867,6 +879,93 @@ async fn bounded_queue_rejects_overflow_without_persisting_a_phantom_task() {
     assert_eq!(g.store.tasks().await.unwrap().len(), 2);
     g.cancel(queued.id.as_str()).await.unwrap();
     g.cancel(running.id.as_str()).await.unwrap();
+    g.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_pi_session_paths_and_fingerprints_do_not_prevent_continuation() {
+    use sqlx::Connection;
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = options(&temp, AgentKind::Pi);
+    let g = Gateway::open(cfg.clone()).await.unwrap();
+    let first = complete(&g, Message::user_text("hello")).await;
+    let original = g
+        .store
+        .context(first.context_id.as_str())
+        .await
+        .unwrap()
+        .unwrap()
+        .native_id
+        .unwrap();
+    g.shutdown().await;
+    drop(g);
+
+    // 模拟旧版本的实例私有会话路径和非空 fingerprint，原生历史仍须原地恢复。
+    let storage = cfg.instance_directory().unwrap();
+    let legacy = storage.join("sessions/old-session.jsonl");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::rename(original, &legacy).unwrap();
+    let store = Store::open(&storage).await.unwrap();
+    store
+        .set_native_id(first.context_id.as_str(), legacy.to_str().unwrap())
+        .await
+        .unwrap();
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new().filename(storage.join("a2alinker.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE contexts SET fingerprint='old-configuration' WHERE id=?")
+        .bind(first.context_id.as_str())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    store.close().await;
+    drop(store);
+
+    cfg.agent.model = Some("new-model".into());
+    let g = Gateway::open(cfg.clone()).await.unwrap();
+    let resumed = complete(
+        &g,
+        Message::user_text("continue").with_context_id(first.context_id.as_str()),
+    )
+    .await;
+    assert_eq!(resumed.status.state, TaskState::Completed);
+    assert_eq!(resumed.artifacts[0].parts[0].as_text(), Some("Hello 2"));
+    assert_eq!(
+        g.store
+            .context(first.context_id.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .native_id
+            .as_deref(),
+        legacy.to_str()
+    );
+    assert!(!storage.join("home").exists());
+    g.shutdown().await;
+    drop(g);
+
+    // 原生文件确实丢失时应报实际错误，而不能悄悄新建空会话继续回答。
+    std::fs::remove_file(&legacy).unwrap();
+    let g = Gateway::open(cfg).await.unwrap();
+    let failed = complete(
+        &g,
+        Message::user_text("continue").with_context_id(first.context_id.as_str()),
+    )
+    .await;
+    assert_eq!(failed.status.state, TaskState::Failed);
+    assert!(
+        failed
+            .status
+            .message
+            .unwrap()
+            .text_content()
+            .unwrap()
+            .contains("Pi session file is missing")
+    );
+    assert!(!legacy.exists());
     g.shutdown().await;
 }
 

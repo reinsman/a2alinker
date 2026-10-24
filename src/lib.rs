@@ -9,7 +9,6 @@ pub mod adapters;
 pub mod options;
 pub mod runtime;
 pub mod server;
-pub mod skills;
 pub mod storage;
 
 pub use options::{AgentKind, Options};

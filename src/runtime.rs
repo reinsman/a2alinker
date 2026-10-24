@@ -26,7 +26,6 @@ use crate::{
         execution::{EXECUTION_EXTENSION, tool_data, tool_event},
     },
     options::Options,
-    skills::SkillSet,
     storage::{Store, metadata},
 };
 
@@ -96,9 +95,7 @@ struct SessionEntry {
 /// Arc 允许路由、请求和后台任务共同持有网关，不会复制整个网关及数据库。
 pub struct Gateway {
     pub options: Arc<Options>,
-    pub skills: SkillSet,
     pub store: Arc<Store>,
-    pub fingerprint: String,
     queue: mpsc::Sender<Work>,
     controls: Mutex<HashMap<String, Control>>,
     queued: Mutex<HashMap<String, QueuedControl>>,
@@ -120,33 +117,28 @@ impl Gateway {
             .canonicalize()
             .context("canonicalize workspace")?;
         options.validate()?;
-        let discovered = SkillSet::discover(&options)?;
         let storage = options.instance_directory()?;
+        // 缺少新实例描述时提前退出，不创建一个空目录影响下次的新旧判断。
+        if !storage.try_exists()? && options.identity.description.is_empty() {
+            tracing::info!(event = "instance.new", name = options.identity.name, storage = %storage.display(), "这是新实例，需要提供 --desc");
+            anyhow::bail!("新实例 {} 必须提供 --desc", options.identity.name);
+        }
         let store = Arc::new(Store::open(&storage).await?);
-        let skills = discovered.snapshot(&storage)?;
-        let fingerprint = options.fingerprint(&skills.digest)?;
-        let home = adapters::prepare_home(&options, &skills.digest)?;
-        tracing::info!(
-            event = "gateway.config", agent = options.agent.kind.as_str(),
+        store
+            .prepare_instance(options.agent.kind, &mut options.identity)
+            .await?;
+        tracing::info!(event = "agent.config", agent = options.agent.kind.as_str(),
             workspace = %options.agent.workspace.display(), storage_root = %options.storage.directory.display(), storage = %storage.display(),
-            skill_count = skills.skills.len(), queue_capacity = options.runtime.queue_capacity,
-            inherit_native_skills = options.skills.inherit_user,
-            selected_skills = ?skills.skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>(),
-            task_timeout_seconds = options.runtime.task_timeout_seconds,
-            private_home = %home.display(), config_digest = fingerprint,
-            "执行配置已准备：技能与原生配置使用实例副本，单个 worker 串行执行任务"
-        );
+            skill_directory_count = options.skills.directories.len(),
+            "直接使用原生配置、认证、技能及会话存储；单个 worker 串行执行任务");
         let options = Arc::new(options);
         let adapter = AdapterContext {
             options: options.clone(),
-            skills: skills.clone(),
-            home,
         };
         // 正式对外报告就绪前，验证原生协议和选中技能；此时不请求模型推理。
-        let preflight_id = uuid::Uuid::new_v4().to_string();
         let preflight = tokio::time::timeout(
             Duration::from_secs(options.runtime.startup_timeout_seconds),
-            adapters::create_session(&adapter, &preflight_id, None),
+            adapters::create_session(&adapter, None),
         )
         .await
         .context("agent preflight timed out")??;
@@ -159,9 +151,7 @@ impl Gateway {
         let (changes, _) = broadcast::channel(256);
         let gateway = Arc::new(Self {
             options,
-            skills,
             store,
-            fingerprint,
             queue,
             controls: Mutex::new(HashMap::new()),
             queued: Mutex::new(HashMap::new()),
@@ -262,18 +252,6 @@ impl Gateway {
             .context_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if let Some(context) = self.store.context(&context_id).await?
-            && context.fingerprint != self.fingerprint
-        {
-            tracing::warn!(
-                event = "context.config_changed",
-                context_id,
-                "拒绝复用 context：执行配置已变化，请创建新的 context"
-            );
-            return Err(ApiError::invalid(
-                "Context belongs to different execution configuration; create a new context",
-            ));
-        }
         if self.store.active_context(&context_id).await? {
             tracing::warn!(
                 event = "context.busy",
@@ -300,11 +278,10 @@ impl Gateway {
         );
         metadata(&mut task).insert(
             "a2alinker".into(),
-            json!({"agent":self.options.agent.kind.as_str(),"configDigest":self.fingerprint,
-            "skillsDigest":self.skills.digest,"runId":uuid::Uuid::new_v4().to_string()}),
+            json!({"agent":self.options.agent.kind.as_str(),"runId":uuid::Uuid::new_v4().to_string()}),
         );
         self.store
-            .insert_task(&task, message.id.as_str(), &digest, &self.fingerprint)
+            .insert_task(&task, message.id.as_str(), &digest)
             .await?;
         // Sender 留给 HTTP 回复入口，Receiver 的所有权交给 worker，再交给 agent。
         let (replies, receiver) = mpsc::channel(1);
@@ -903,7 +880,7 @@ async fn execute(
         );
         let start = tokio::time::timeout(
             Duration::from_secs(adapter.options.runtime.startup_timeout_seconds),
-            adapters::create_session(adapter, &context_id, stored.native_id.as_deref()),
+            adapters::create_session(adapter, stored.native_id.as_deref()),
         );
         // 启动握手也可被取消；即使 agent 没有回应，外层仍有超时保证。
         let session = tokio::select! {

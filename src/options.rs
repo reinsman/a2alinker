@@ -1,5 +1,5 @@
 //! 运行选项的数据结构、默认值、路径处理和校验，不负责读取 a2alinker 配置文件。
-//! 库调用方和命令行共同使用这些结构；执行指纹用于判断旧会话能否安全复用。
+//! 库调用方和命令行共同使用这些结构；原生配置与技能直接交给 agent 使用。
 
 use std::{
     collections::BTreeMap,
@@ -10,7 +10,6 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +63,7 @@ impl Default for ServerOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct IdentityOptions {
     pub name: String,
+    /// 空字符串表示启动时读取本地实例的描述；新实例必须提供非空描述。
     pub description: String,
 }
 impl Default for IdentityOptions {
@@ -80,14 +80,16 @@ impl Default for IdentityOptions {
 pub struct AgentOptions {
     pub kind: AgentKind,
     pub executable: Option<PathBuf>,
-    /// 显式覆盖原生配置；默认分别查找用户的 settings.json 或 config.toml。
+    /// 在同一个 Bash 中准备环境，再 exec agent；None 时直接启动可执行文件。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepare: Option<String>,
+    /// 指定原生配置目录或标准配置文件；None 时完整沿用 agent 的默认发现规则。
     pub native_config: Option<PathBuf>,
     pub workspace: PathBuf,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    pub inherit_auth: bool,
     pub allow_extensions: bool,
     /// None 沿用 Codex 原生配置；库调用方可显式覆盖。
     pub sandbox: Option<String>,
@@ -98,13 +100,13 @@ impl Default for AgentOptions {
         Self {
             kind: AgentKind::Pi,
             executable: None,
+            prepare: None,
             native_config: None,
             workspace: ".".into(),
             model: None,
             provider: None,
             args: vec![],
             env: BTreeMap::new(),
-            inherit_auth: true,
             allow_extensions: true,
             sandbox: None,
             approval_policy: None,
@@ -112,23 +114,11 @@ impl Default for AgentOptions {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SkillsOptions {
+    /// 直接交给原生 agent 的附加技能目录；不复制，也不自动禁用其他原生技能。
     pub directories: Vec<PathBuf>,
-    pub enabled: Vec<String>,
-    pub inherit_user: bool,
-}
-
-impl Default for SkillsOptions {
-    fn default() -> Self {
-        // 默认沿用 agent 原生技能发现规则，显式技能目录由调用方设置。
-        Self {
-            directories: vec![],
-            enabled: vec![],
-            inherit_user: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -247,8 +237,15 @@ impl Options {
     /// 校验跨字段约束；ensure! 在条件不满足时直接返回错误。
     pub fn validate(&self) -> Result<()> {
         self.instance_directory()?;
+        if let Some(prepare) = &self.agent.prepare {
+            ensure!(!prepare.trim().is_empty(), "--prepare must not be blank");
+            ensure!(
+                cfg!(unix),
+                "--prepare currently requires Unix and /bin/bash"
+            );
+        }
         ensure!(
-            !self.identity.description.trim().is_empty(),
+            self.identity.description.is_empty() || !self.identity.description.trim().is_empty(),
             "agent description must not be empty"
         );
         ensure!(
@@ -256,14 +253,7 @@ impl Options {
             "workspace is not a directory: {}",
             self.agent.workspace.display()
         );
-        if let Some(p) = self.effective_native_config()? {
-            ensure!(
-                p.exists(),
-                "native configuration does not exist: {}",
-                p.display()
-            );
-        }
-        self.native_model_config()?;
+        self.native_config_directory()?;
         for p in &self.skills.directories {
             ensure!(
                 p.is_dir(),
@@ -353,83 +343,34 @@ impl Options {
             .unwrap_or_else(|| self.agent.kind.as_str().into())
     }
 
-    /// 原始用户配置目录。先取 agent.env 中的覆盖项，再取启动网关时的环境变量。
-    /// agent 真正启动时会使用实例私有目录，这里保留的是复制配置和凭据的来源。
-    pub fn user_agent_directory(&self) -> Result<Option<PathBuf>> {
-        let env = |key: &str| {
-            self.agent
-                .env
-                .get(key)
-                .map(std::ffi::OsString::from)
-                .or_else(|| std::env::var_os(key))
-                .filter(|value| !value.is_empty())
+    /// 只处理显式指定的配置，不探测或读取默认配置，也不读取认证文件。
+    /// 原生接口使用目录；标准配置文件通过其所在目录直接使用。
+    pub fn native_config_directory(&self) -> Result<Option<PathBuf>> {
+        let Some(path) = &self.agent.native_config else {
+            return Ok(None);
         };
-        let (key, fallback) = match self.agent.kind {
-            AgentKind::Pi => ("PI_CODING_AGENT_DIR", ".pi/agent"),
-            AgentKind::Codex => ("CODEX_HOME", ".codex"),
-        };
-        env(key)
-            .map(PathBuf::from)
-            .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(fallback)))
-            .map(|directory| absolute(&directory, &self.agent.workspace))
-            .transpose()
-    }
-
-    /// 显式 native_config 优先；pi 省略时读取用户 settings.json，
-    /// Codex 默认读取用户 config.toml，以保留模型、技能、沙箱与审批设置。
-    /// 默认文件不存在则使用 agent 内置默认值。
-    /// 不修改配置字段，确保 CLI 在覆盖 agent 类型后仍能选到正确的默认文件。
-    pub fn effective_native_config(&self) -> Result<Option<PathBuf>> {
-        if let Some(path) = &self.agent.native_config {
+        if path.is_dir() {
             return Ok(Some(path.clone()));
         }
+        ensure!(
+            path.is_file(),
+            "native configuration does not exist: {}",
+            path.display()
+        );
         let filename = match self.agent.kind {
             AgentKind::Pi => "settings.json",
             AgentKind::Codex => "config.toml",
         };
-        if let Some(directory) = self.user_agent_directory()? {
-            let path = directory.join(filename);
-            if path
-                .try_exists()
-                .with_context(|| format!("check default agent configuration {}", path.display()))?
-            {
-                ensure!(
-                    path.is_file(),
-                    "default agent configuration is not a file: {}",
-                    path.display()
-                );
-                return Ok(Some(path));
-            }
-        }
-        Ok(None)
-    }
-
-    /// pi 的自定义 provider/模型定义。单文件配置同时携带其同目录的 models.json；
-    /// 省略配置时读取用户默认目录，显式目录则已由完整目录复制流程处理。
-    pub fn native_model_config(&self) -> Result<Option<PathBuf>> {
-        if self.agent.kind != AgentKind::Pi {
-            return Ok(None);
-        }
-        let directory = match &self.agent.native_config {
-            Some(path) if path.is_dir() => return Ok(None),
-            Some(path) => path.parent().map(Path::to_path_buf),
-            None => self.user_agent_directory()?,
-        };
-        if let Some(directory) = directory {
-            let path = directory.join("models.json");
-            if path
-                .try_exists()
-                .with_context(|| format!("check pi model configuration {}", path.display()))?
-            {
-                ensure!(
-                    path.is_file(),
-                    "pi model configuration is not a file: {}",
-                    path.display()
-                );
-                return Ok(Some(path));
-            }
-        }
-        Ok(None)
+        ensure!(
+            path.file_name().is_some_and(|name| name == filename),
+            "--agent-config for {} must be a directory or a file named {filename}; files are used directly, not copied or renamed",
+            self.agent.kind.as_str()
+        );
+        Ok(Some(
+            path.parent()
+                .context("native configuration has no parent directory")?
+                .to_path_buf(),
+        ))
     }
 
     pub fn public_url(&self) -> String {
@@ -439,56 +380,6 @@ impl Options {
             .unwrap_or_else(|| format!("http://{}", self.server.listen))
             .trim_end_matches('/')
             .into()
-    }
-
-    /// 对执行配置、原生配置文件和技能摘要取哈希，防止旧 context 静默换用新配置。
-    pub fn fingerprint(&self, skill_digest: &str) -> Result<String> {
-        // 只有执行设置影响会话兼容性；其中的凭据参与哈希，但不输出明文到日志。
-        let content = serde_json::to_vec(&(&self.agent, &self.skills, skill_digest))?;
-        let mut digest = Sha256::new();
-        digest.update(content);
-        if let Some(path) = self.effective_native_config()? {
-            // 自动发现的路径不在 agent.native_config 字段中，也需要纳入执行指纹。
-            if self.agent.native_config.is_none() {
-                digest.update(serde_json::to_vec(&path)?);
-            }
-            if path.is_file() {
-                digest.update(std::fs::read(path)?);
-            } else {
-                let mut total = 0u64;
-                for entry in walkdir::WalkDir::new(&path).sort_by_file_name() {
-                    let entry = entry?;
-                    ensure!(
-                        !entry.file_type().is_symlink(),
-                        "native configuration must not contain symlinks"
-                    );
-                    if entry.file_type().is_file() {
-                        total += entry.metadata()?.len();
-                        ensure!(
-                            total <= 64 * 1024 * 1024,
-                            "native configuration exceeds 64 MiB; supply a dedicated configuration directory"
-                        );
-                        digest.update(
-                            entry
-                                .path()
-                                .strip_prefix(&path)?
-                                .to_string_lossy()
-                                .as_bytes(),
-                        );
-                        digest.update([0]);
-                        digest.update(entry.metadata()?.len().to_le_bytes());
-                        digest.update(std::fs::read(entry.path())?);
-                    }
-                }
-            }
-        }
-        // 模型端点、API 类型或凭据变化后也要隔离旧会话，且不在日志中暴露这些内容。
-        if let Some(path) = self.native_model_config()? {
-            digest.update(b"pi-models\0");
-            digest.update(serde_json::to_vec(&path)?);
-            digest.update(std::fs::read(path)?);
-        }
-        Ok(format!("{:x}", digest.finalize()))
     }
 }
 

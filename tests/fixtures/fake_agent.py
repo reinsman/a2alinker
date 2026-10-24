@@ -26,14 +26,15 @@ TURN = None
 PENDING = None
 ROOTS = []
 ENABLED = {}
+HOME = pathlib.Path(os.environ.get("PI_CODING_AGENT_DIR" if PI else "CODEX_HOME") or
+                    pathlib.Path(os.environ["HOME"]) / (".pi/agent" if PI else ".codex"))
+if PI:
+    SESSION = (pathlib.Path(sys.argv[sys.argv.index("--session") + 1]) if "--session" in sys.argv else
+               HOME / "sessions" / (str(uuid.uuid4()) + ".jsonl"))
 STARTUP_TRACE = os.environ.get("A2ALINKER_TEST_TRACE")
 if STARTUP_TRACE:
     with open(STARTUP_TRACE, "a") as f:
-        f.write(json.dumps({"pid": os.getpid(), "startup": {"args": sys.argv[1:]}}) + "\n")
-if PI:
-    SESSION = pathlib.Path(sys.argv[sys.argv.index("--session") + 1])
-else:
-    HOME = pathlib.Path(os.environ["CODEX_HOME"])
+        f.write(json.dumps({"pid": os.getpid(), "startup": {"args": sys.argv[1:], "configHome": str(HOME)}}) + "\n")
 
 
 def emit(value):
@@ -183,17 +184,18 @@ for line in sys.stdin:
                 skills.append({"name": name, "path": str(path), "enabled": ENABLED.get(str(path), native_enabled)})
         response(request, {"data": [{"cwd": os.getcwd(), "skills": skills, "errors": []}]})
     elif method == "get_commands":
-        paths = [pathlib.Path(sys.argv[i + 1]) for i, value in enumerate(sys.argv) if value == "--skill"]
+        paths = []
+        for i, value in enumerate(sys.argv):
+            if value == "--skill":
+                root = pathlib.Path(sys.argv[i + 1])
+                paths.extend(root.rglob("SKILL.md") if root.is_dir() else [root])
         if "--no-skills" not in sys.argv:
-            paths.extend((pathlib.Path(os.environ["PI_CODING_AGENT_DIR"]) / "skills").rglob("SKILL.md"))
+            paths.extend((HOME / "skills").rglob("SKILL.md"))
         response(request, {"commands": [{"source": "skill", "name": "skill:" + re.search(r"^name: (.+)$", p.read_text(), re.M).group(1)} for p in paths]})
     elif method in ("thread/start", "thread/resume"):
         THREAD = request["params"].get("threadId", "fixture-" + str(uuid.uuid4()))
         response(request, {"thread": {"id": THREAD}})
     elif method == "get_state":
-        if not SESSION.exists():
-            SESSION.parent.mkdir(parents=True, exist_ok=True)
-            SESSION.write_text('{"turns":0}')
         response(request, {"sessionFile": str(SESSION), "isStreaming": False})
     elif method in ("prompt", "turn/start"):
         CANCEL.clear()

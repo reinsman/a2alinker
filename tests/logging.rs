@@ -75,10 +75,15 @@ async fn learning_logs_explain_lifecycle_dedup_interaction_and_disconnect_withou
     let temp = tempfile::tempdir().unwrap();
     let mut cfg = Options::default();
     cfg.agent.kind = AgentKind::Pi;
+    #[cfg(unix)]
+    {
+        cfg.agent.prepare = Some(
+            "printf 'PREPARE_MUST_STAY_PRIVATE'; export HTTP_PROXY=http://127.0.0.1:7890".into(),
+        );
+    }
     cfg.agent.executable =
         Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_agent.py"));
     cfg.agent.workspace = temp.path().into();
-    cfg.agent.inherit_auth = false;
     cfg.agent.env.insert(
         "PI_CODING_AGENT_DIR".into(),
         temp.path().join("user-pi").display().to_string(),
@@ -293,6 +298,7 @@ async fn learning_logs_explain_lifecycle_dedup_interaction_and_disconnect_withou
         "SIGNATURE_MUST_NOT_BE_FORWARDED",
         "TOOL_SECRET_MUST_BE_REDACTED",
         "RESULT_SECRET_MUST_BE_REDACTED",
+        "PREPARE_MUST_STAY_PRIVATE",
     ] {
         assert!(!logs.contains(private), "private content leaked into logs");
     }

@@ -5,7 +5,6 @@ use std::{collections::HashSet, time::Duration};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -22,39 +21,22 @@ pub struct PiSession {
 }
 
 impl PiSession {
-    /// 创建/恢复会话并验证技能；此方法只握手，不向模型发送 prompt。
-    pub async fn start(
-        context: &AdapterContext,
-        context_id: &str,
-        native: Option<&str>,
-    ) -> Result<Self> {
-        let session_dir = context.options.instance_directory()?.join("sessions");
-        std::fs::create_dir_all(&session_dir)?;
-        // 外部 contextId 先哈希成文件名，避免客户端通过 ../ 等内容控制会话文件路径。
-        let path = native.map(std::path::PathBuf::from).unwrap_or_else(|| {
-            session_dir.join(format!("{:x}.jsonl", Sha256::digest(context_id.as_bytes())))
-        });
-        // 只有恢复已有会话才要求文件存在；pi 通常在首次 assistant 消息后才将新会话写盘。
-        if native.is_some() {
+    /// 创建/恢复原生会话；新会话的路径由 Pi 决定，此处只握手，不请求模型。
+    pub async fn start(context: &AdapterContext, native: Option<&str>) -> Result<Self> {
+        let mut args: Vec<String> = vec!["--mode".into(), "rpc".into()];
+        if let Some(path) = native {
+            // 恢复数据库中的原路径，包括旧版本保存在 storage/sessions 中的文件。
             ensure!(
-                path.is_file(),
+                std::path::Path::new(path).is_file(),
                 "Pi session file is missing; refusing to silently reset context"
             );
-        }
-        let mut args: Vec<String> = vec![
-            "--mode".into(),
-            "rpc".into(),
-            "--session".into(),
-            path.to_string_lossy().into(),
-        ];
-        if !context.options.skills.inherit_user {
-            args.push("--no-skills".into());
+            args.extend(["--session".into(), path.into()]);
         }
         if !context.options.agent.allow_extensions {
             args.push("--no-extensions".into());
         }
-        for skill in &context.skills.skills {
-            args.extend(["--skill".into(), skill.path.to_string_lossy().into()]);
+        for directory in &context.options.skills.directories {
+            args.extend(["--skill".into(), directory.to_string_lossy().into()]);
         }
         if let Some(model) = &context.options.agent.model {
             args.extend(["--model".into(), model.clone()]);
@@ -73,26 +55,12 @@ impl PiSession {
                 "pi model selected"
             );
         }
-        if !context.skills.skills.is_empty() {
-            let commands = process.request("get_commands", json!({}), true).await?;
-            for skill in &context.skills.skills {
-                ensure!(
-                    commands["commands"]
-                        .as_array()
-                        .is_some_and(|commands| commands
-                            .iter()
-                            .any(|command| command["source"] == "skill"
-                                && command["name"] == format!("skill:{}", skill.name))),
-                    "Pi did not load selected skill {}",
-                    skill.name
-                );
-            }
-        }
         let native_id = state
             .get("sessionFile")
             .and_then(Value::as_str)
-            .unwrap_or(path.to_str().unwrap())
-            .to_string();
+            .filter(|path| !path.is_empty())
+            .context("Pi did not return a persistent sessionFile")?
+            .to_owned();
         Ok(Self {
             process,
             native_id,

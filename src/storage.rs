@@ -1,7 +1,11 @@
-//! SQLite 持久化层：保存任务、原生会话映射、消息去重记录和 SSE 事件。
+//! SQLite 持久化层：保存实例身份、任务、原生会话映射、消息去重记录和 SSE 事件。
 //! 对外提供异步方法，SQL 参数通过 bind 传入，避免拼接客户端输入。
 
-use std::{fs::File, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -12,10 +16,14 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
+use crate::options::{AgentKind, IdentityOptions};
+
 /// 持有数据库连接池和实例文件锁；只要 Store 存活，锁文件句柄就保持打开。
 pub struct Store {
     pool: SqlitePool,
     _lock: File,
+    directory: PathBuf,
+    directory_existed: bool,
 }
 
 impl Drop for Store {
@@ -29,11 +37,11 @@ impl Drop for Store {
 #[derive(Debug)]
 pub struct ContextRecord {
     pub native_id: Option<String>,
-    pub fingerprint: String,
 }
 
 impl Store {
     pub async fn open(directory: &Path) -> Result<Self> {
+        let directory_existed = directory.try_exists()?;
         std::fs::create_dir_all(directory)?;
         #[cfg(unix)]
         {
@@ -58,7 +66,7 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS contexts (
-            id TEXT PRIMARY KEY, native_id TEXT, fingerprint TEXT NOT NULL);
+            id TEXT PRIMARY KEY, native_id TEXT, fingerprint TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY, context_id TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS tasks_context ON tasks(context_id);
@@ -66,22 +74,118 @@ impl Store {
             id TEXT PRIMARY KEY, digest TEXT NOT NULL, task_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
             seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, body TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);")
+            CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);
+            CREATE TABLE IF NOT EXISTS instance (
+            id INTEGER PRIMARY KEY CHECK(id=1), agent TEXT NOT NULL, description TEXT NOT NULL);")
             .execute(&pool).await?;
-        Ok(Self { pool, _lock: lock })
+        Ok(Self {
+            pool,
+            _lock: lock,
+            directory: directory.into(),
+            directory_existed,
+        })
+    }
+
+    /// 在目录锁保护下核对实例身份；不允许同一个名字静默切换 agent。
+    /// 显式描述会更新本地记录，省略描述则使用原记录。
+    pub(crate) async fn prepare_instance(
+        &self,
+        agent: AgentKind,
+        identity: &mut IdentityOptions,
+    ) -> Result<()> {
+        let saved: Option<(String, String)> =
+            sqlx::query_as("SELECT agent,description FROM instance WHERE id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        if saved.is_some() || self.directory_existed {
+            tracing::info!(event = "instance.existing", name = identity.name, storage = %self.directory.display(), "发现本地已有实例，核对 agent 类型并读取描述");
+        } else {
+            tracing::info!(event = "instance.new", name = identity.name, storage = %self.directory.display(), "这是新实例，将保存 agent 类型和描述");
+        }
+        if let Some((stored_agent, description)) = saved {
+            ensure!(
+                stored_agent == agent.as_str(),
+                "实例 {} 的 agent 为 {stored_agent}，与本次指定的 {} 不一致，请使用原 agent 或换一个 --name",
+                identity.name,
+                agent.as_str()
+            );
+            if identity.description.is_empty() {
+                identity.description = description;
+            }
+        } else {
+            // 旧版本没有 instance 表记录；交叉检查旧任务和原生进程目录后再登记。
+            let tasks = self.tasks().await?;
+            let mut agents = BTreeSet::new();
+            for task in &tasks {
+                if let Some(kind) = task
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("a2alinker"))
+                    .and_then(|metadata| metadata.get("agent"))
+                    .and_then(Value::as_str)
+                {
+                    agents.insert(kind.to_owned());
+                }
+            }
+            for kind in [AgentKind::Pi, AgentKind::Codex] {
+                if self
+                    .directory
+                    .join("home")
+                    .join(kind.as_str())
+                    .try_exists()?
+                {
+                    agents.insert(kind.as_str().to_owned());
+                }
+            }
+            ensure!(
+                agents.len() <= 1,
+                "实例 {} 的旧数据包含多个 agent 类型，无法确定实例身份",
+                identity.name
+            );
+            if let Some(stored_agent) = agents.first() {
+                ensure!(
+                    stored_agent == agent.as_str(),
+                    "实例 {} 的 agent 为 {stored_agent}，与本次指定的 {} 不一致，请使用原 agent 或换一个 --name",
+                    identity.name,
+                    agent.as_str()
+                );
+            } else {
+                ensure!(
+                    tasks.is_empty(),
+                    "无法确定旧实例 {} 的 agent 类型，不能自动登记",
+                    identity.name
+                );
+            }
+            ensure!(
+                !identity.description.trim().is_empty(),
+                "实例 {} 首次登记必须提供 --desc；旧版本未保存描述，也需要补充一次",
+                identity.name
+            );
+        }
+        ensure!(
+            !identity.description.trim().is_empty(),
+            "实例描述不能为空，请提供 --desc"
+        );
+        // agent 不参与冲突更新，避免意外改写已登记的实例类型。
+        sqlx::query(
+            "INSERT INTO instance (id,agent,description) VALUES (1,?,?)
+            ON CONFLICT(id) DO UPDATE SET description=excluded.description",
+        )
+        .bind(agent.as_str())
+        .bind(&identity.description)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn context(&self, id: &str) -> Result<Option<ContextRecord>> {
-        Ok(
-            sqlx::query("SELECT native_id, fingerprint FROM contexts WHERE id=?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?
-                .map(|row| ContextRecord {
-                    native_id: row.get("native_id"),
-                    fingerprint: row.get("fingerprint"),
-                }),
-        )
+        Ok(sqlx::query("SELECT native_id FROM contexts WHERE id=?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| ContextRecord {
+                native_id: row.get("native_id"),
+            }))
     }
 
     pub async fn set_native_id(&self, id: &str, native: &str) -> Result<()> {
@@ -104,18 +208,12 @@ impl Store {
     }
 
     /// 在同一事务中创建任务、context、去重记录和初始事件，避免只写入其中一部分。
-    pub async fn insert_task(
-        &self,
-        task: &Task,
-        message_id: &str,
-        digest: &str,
-        fingerprint: &str,
-    ) -> Result<()> {
+    pub async fn insert_task(&self, task: &Task, message_id: &str, digest: &str) -> Result<()> {
         // ? 遇到错误会提前返回；事务没有 commit 就被释放时，SQLx 会安排回滚。
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT OR IGNORE INTO contexts (id,fingerprint) VALUES (?,?)")
+        // 保留旧表的 NOT NULL fingerprint 列以兼容历史数据库；新任务不再计算或比较指纹。
+        sqlx::query("INSERT OR IGNORE INTO contexts (id,fingerprint) VALUES (?, '')")
             .bind(task.context_id.as_str())
-            .bind(fingerprint)
             .execute(&mut *tx)
             .await?;
         sqlx::query("INSERT INTO tasks (id,context_id,state,updated_at,body) VALUES (?,?,?,?,?)")
@@ -277,4 +375,108 @@ async fn save(
 /// 懒创建 metadata，并返回它的可变借用；调用者直接修改任务中原来的映射。
 pub fn metadata(task: &mut Task) -> &mut std::collections::HashMap<String, Value> {
     task.metadata.get_or_insert_with(Default::default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn legacy_task_identity_is_checked_before_registration_or_task_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        let mut task = Task::new("old-task", "old-context");
+        metadata(&mut task).insert("a2alinker".into(), json!({"agent":"pi"}));
+        store
+            .insert_task(&task, "old-message", "digest")
+            .await
+            .unwrap();
+        let mut identity = IdentityOptions {
+            name: "Alan".into(),
+            description: "升级后的描述".into(),
+        };
+        let error = store
+            .prepare_instance(AgentKind::Codex, &mut identity)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("agent 为 pi"));
+        assert_eq!(
+            store.task("old-task").await.unwrap().unwrap().status.state,
+            task.status.state
+        );
+        identity.description.clear();
+        assert!(
+            store
+                .prepare_instance(AgentKind::Pi, &mut identity)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("--desc")
+        );
+        identity.description = "升级后的描述".into();
+        store
+            .prepare_instance(AgentKind::Pi, &mut identity)
+            .await
+            .unwrap();
+        store.close().await;
+        drop(store);
+        let store = Store::open(temp.path()).await.unwrap();
+        identity.description.clear();
+        store
+            .prepare_instance(AgentKind::Pi, &mut identity)
+            .await
+            .unwrap();
+        assert_eq!(identity.description, "升级后的描述");
+        assert!(store.task("old-task").await.unwrap().is_some());
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_home_and_conflicting_or_unknown_history_are_not_silently_rebound() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).await.unwrap();
+        std::fs::create_dir_all(temp.path().join("home/codex/old-profile")).unwrap();
+        let mut identity = IdentityOptions::default();
+        assert!(
+            store
+                .prepare_instance(AgentKind::Pi, &mut identity)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("agent 为 codex")
+        );
+        let mut task = Task::new("old-task", "old-context");
+        metadata(&mut task).insert("a2alinker".into(), json!({"agent":"pi"}));
+        store
+            .insert_task(&task, "old-message", "digest")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .prepare_instance(AgentKind::Pi, &mut identity)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("多个 agent")
+        );
+        store.close().await;
+
+        let unknown = tempfile::tempdir().unwrap();
+        let store = Store::open(unknown.path()).await.unwrap();
+        let task = Task::new("unknown-task", "unknown-context");
+        store
+            .insert_task(&task, "unknown-message", "digest")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .prepare_instance(AgentKind::Pi, &mut identity)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("无法确定旧实例")
+        );
+        store.close().await;
+    }
 }

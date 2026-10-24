@@ -2,6 +2,7 @@
 
 mod codex;
 pub(crate) mod execution;
+mod launch;
 mod pi;
 pub mod process;
 
@@ -19,10 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use execution::{ToolEvent, ToolPhase};
 
-use crate::{
-    options::{AgentKind, Options},
-    skills::{SkillSet, copy_directory},
-};
+use crate::options::{AgentKind, Options};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,8 +69,6 @@ pub enum RunOutcome {
 #[derive(Clone)]
 pub struct AdapterContext {
     pub options: Arc<Options>,
-    pub skills: SkillSet,
-    pub home: PathBuf,
 }
 
 /// trait 类似其他语言的接口；每种 agent 实现相同的会话操作。
@@ -93,136 +89,29 @@ pub trait AgentSession: Send {
 /// native_id 为 Some 时恢复已有会话，否则创建新会话；返回值隐藏具体适配器类型。
 pub async fn create_session(
     context: &AdapterContext,
-    context_id: &str,
     native_id: Option<&str>,
 ) -> Result<Box<dyn AgentSession>> {
     match context.options.agent.kind {
-        AgentKind::Pi => Ok(Box::new(
-            pi::PiSession::start(context, context_id, native_id).await?,
-        )),
+        AgentKind::Pi => Ok(Box::new(pi::PiSession::start(context, native_id).await?)),
         AgentKind::Codex => Ok(Box::new(
             codex::CodexSession::start(context, native_id).await?,
         )),
     }
 }
 
-/// 建立实例私有的 agent 配置目录；复制所需文件，不修改用户原始配置。
-pub fn prepare_home(options: &Options, skill_digest: &str) -> Result<PathBuf> {
-    let home = options
-        .instance_directory()?
-        .join("home")
-        .join(options.agent.kind.as_str())
-        .join(options.fingerprint(skill_digest)?);
-    std::fs::create_dir_all(&home)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
-    }
-    if let Some(source) = options.effective_native_config()? {
-        if source.is_dir() {
-            ensure!(
-                !home.canonicalize()?.starts_with(source.canonicalize()?),
-                "runtime storage must be outside the native configuration directory"
-            );
-            copy_directory(&source, &home)?;
-        } else {
-            let filename = match options.agent.kind {
-                AgentKind::Pi => "settings.json",
-                AgentKind::Codex => "config.toml",
-            };
-            std::fs::copy(&source, home.join(filename)).context("copy native configuration")?;
-        }
-        tracing::info!(event = "config.native", source = %source.display(), destination = %home.display(), "原生配置已复制到实例私有目录，不修改来源文件");
-    }
-    inherit_resources(options, &home)?;
-    // settings.json 只保存模型选择；自定义 provider 的端点、API 和 key 在 models.json。
-    if let Some(source) = options.native_model_config()? {
-        std::fs::copy(&source, home.join("models.json")).context("copy pi model configuration")?;
-        tracing::info!(event = "config.models", source = %source.display(), "pi 自定义 provider/model 配置已复制；只显示来源路径，不显示密钥或文件内容");
-    }
-    if options.agent.inherit_auth && !home.join("auth.json").exists() {
-        // 配置与登录文件使用同一套来源规则，避免指定 PI_CODING_AGENT_DIR 后混用其他账号。
-        let source = options.user_agent_directory()?;
-        if let Some(source) = source.map(|p| p.join("auth.json")).filter(|p| p.is_file()) {
-            std::fs::copy(source, home.join("auth.json"))?;
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for name in [
-            "auth.json",
-            "config.toml",
-            "settings.json",
-            "models.json",
-            "trust.json",
-        ] {
-            let path = home.join(name);
-            if path.exists() {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
-    }
-    Ok(home)
-}
-
-/// 私有 agent home 会改变原生全局资源的查找位置。通过目录链接保留原生资源，
-/// 不复制全部用户配置，也不修改来源目录。显式原生配置目录中已有的资源优先。
-fn inherit_resources(options: &Options, home: &Path) -> Result<()> {
-    let Some(source) = options.user_agent_directory()? else {
-        return Ok(());
-    };
-    let mut names = match options.agent.kind {
-        crate::options::AgentKind::Pi => vec!["git", "npm", "prompts", "themes"],
-        crate::options::AgentKind::Codex => vec![],
-    };
-    if options.skills.inherit_user {
-        names.push("skills");
-    }
-    if options.agent.kind == crate::options::AgentKind::Pi && options.agent.allow_extensions {
-        names.push("extensions");
-    }
-    for name in names {
-        let from = source.join(name);
-        let to = home.join(name);
-        if !from.is_dir() || std::fs::symlink_metadata(&to).is_ok() {
-            continue;
-        }
-        let from = from
-            .canonicalize()
-            .context("resolve native skill resources")?;
-        ensure!(
-            !home.canonicalize()?.starts_with(&from),
-            "runtime storage must be outside inherited skill resources"
-        );
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&from, &to).context("link native skill resources")?;
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&from, &to).context("link native skill resources")?;
-        tracing::info!(event = "config.resources_inherited", source = %from.display(), destination = %to.display(), "沿用 agent 原生资源；保留原生启用和禁用设置");
-    }
-    // pi 的项目技能受原生信任规则控制；保留已有信任决定，避免换 home 后全部变成未信任。
-    // 运行中产生的新决定仍留在私有副本，不写回用户原文件。
-    let trust = source.join("trust.json");
-    if options.agent.kind == crate::options::AgentKind::Pi
-        && trust.is_file()
-        && !home.join("trust.json").exists()
-    {
-        std::fs::copy(trust, home.join("trust.json")).context("copy pi trust settings")?;
-    }
-    Ok(())
-}
-
 /// 只运行 --version，附带启动超时；真实协议兼容性由后续 create_session 验证。
 pub async fn probe(options: &Options) -> Result<String> {
+    let mut command = launch::command(options)?;
+    let child = command.arg("--version").spawn().with_context(|| {
+        format!(
+            "cannot start agent executable '{}'; check --prepare, --executable and PATH",
+            options.executable().display()
+        )
+    })?;
+    let _group = launch::ProcessGroup::new(child.id());
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(options.runtime.startup_timeout_seconds),
-        tokio::process::Command::new(options.executable())
-            .arg("--version")
-            .envs(&options.agent.env)
-            .kill_on_drop(true)
-            .output(),
+        child.wait_with_output(),
     )
     .await
     .context("agent version probe timed out")?
@@ -234,7 +123,8 @@ pub async fn probe(options: &Options) -> Result<String> {
     })?;
     ensure!(
         output.status.success(),
-        "agent --version exited unsuccessfully"
+        "agent --version exited unsuccessfully: {} (check --prepare and --executable)",
+        output.status
     );
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }

@@ -134,6 +134,21 @@ impl Running {
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    fn failure(&mut self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.process.try_wait().unwrap() {
+                assert!(!status.success(), "service unexpectedly succeeded");
+                return fs::read_to_string(&self.log).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "service did not reject invalid startup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for Running {
@@ -159,11 +174,114 @@ fn http(address: SocketAddr, method: &str, path: &str, body: &str) -> Value {
 }
 
 #[test]
-fn bare_serve_uses_pi_current_workspace_native_skills_and_user_storage() {
+fn missing_name_or_new_description_is_rejected_without_starting_an_agent() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     setup(root);
-    let mut server = Running::start(root, &["--listen", "0", "--executable", "   "], &[]);
+    let mut missing_name = Running::start(root, &["--desc", "开发助手"], &[]);
+    assert!(missing_name.failure().contains("--name"));
+    let mut missing_description = Running::start(root, &["--name", "Alan"], &[]);
+    let log = missing_description.failure();
+    assert!(log.contains("instance.new"));
+    assert!(log.contains("必须提供 --desc"));
+    assert!(!root.join("user/.rein/storage/Alan").exists());
+    for description in ["", " \t"] {
+        let mut blank = Running::start(root, &["--name", "Alan", "--desc", description], &[]);
+        assert!(blank.failure().contains("描述不能为空"));
+    }
+    // 已存在但尚未登记的空目录，也必须填写描述才能完成初始化。
+    fs::create_dir_all(root.join("user/.rein/storage/Empty")).unwrap();
+    let mut empty = Running::start(root, &["--name", "Empty"], &[]);
+    let log = empty.failure();
+    assert!(log.contains("instance.existing"));
+    assert!(log.contains("必须提供 --desc"));
+    assert!(!root.join("trace.jsonl").exists());
+}
+
+#[test]
+fn instance_identity_survives_restart_and_rejects_another_agent_before_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    let mut initial = Running::start(
+        root,
+        &["--listen", "0"],
+        &[
+            ("A2ALINKER_NAME", "Alan"),
+            ("A2ALINKER_DESC", "原始项目助手"),
+        ],
+    );
+    let address = initial.ready();
+    assert_eq!(
+        http(address, "GET", "/.well-known/agent-card.json", "")["description"],
+        "原始项目助手"
+    );
+    assert!(
+        fs::read_to_string(&initial.log)
+            .unwrap()
+            .contains("instance.new")
+    );
+    initial.stop();
+    let trace = fs::read_to_string(root.join("trace.jsonl")).unwrap();
+    let mut wrong = Running::start(
+        root,
+        &[
+            "codex",
+            "--name",
+            "Alan",
+            "--desc",
+            "不能覆盖原描述",
+            "--listen",
+            "0",
+        ],
+        &[],
+    );
+    let log = wrong.failure();
+    assert!(log.contains("instance.existing"));
+    assert!(log.contains("agent 为 pi"));
+    assert!(log.contains("codex 不一致"));
+    assert_eq!(fs::read_to_string(root.join("trace.jsonl")).unwrap(), trace);
+    for (description, expected) in [
+        (None, "原始项目助手"),
+        (Some("更新后的项目助手"), "更新后的项目助手"),
+        (None, "更新后的项目助手"),
+    ] {
+        let mut args = vec!["--name", "Alan", "--listen", "0"];
+        if let Some(description) = description {
+            args.extend(["--desc", description]);
+        }
+        let mut resumed = Running::start(root, &args, &[]);
+        let address = resumed.ready();
+        let card = http(address, "GET", "/.well-known/agent-card.json", "");
+        assert_eq!(card["description"], expected);
+        assert!(
+            fs::read_to_string(&resumed.log)
+                .unwrap()
+                .contains("instance.existing")
+        );
+        resumed.stop();
+    }
+}
+
+#[test]
+fn serve_uses_pi_current_workspace_native_skills_and_user_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    setup(root);
+    let mut server = Running::start(
+        root,
+        &[
+            "--name",
+            "Alan",
+            "--desc",
+            "本地 pi 编程助手",
+            "--listen",
+            "0",
+            "--executable",
+            "   ",
+        ],
+        &[],
+    );
     let address = server.ready();
     let card = http(address, "GET", "/.well-known/agent-card.json", "");
     assert_eq!(card["name"], "Alan");
@@ -187,16 +305,10 @@ fn bare_serve_uses_pi_current_workspace_native_skills_and_user_storage() {
     );
     let storage = root.join("user/.rein/storage/Alan");
     assert!(storage.join("a2alinker.db").is_file());
-    let home = fs::read_dir(storage.join("home/pi"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert_eq!(
-        home.join("skills").canonicalize().unwrap(),
-        root.join("user/.pi/agent/skills").canonicalize().unwrap()
-    );
+    assert!(!storage.join("home").exists());
+    assert!(!storage.join("sessions").exists());
+    assert!(!storage.join("skills").exists());
+    assert!(root.join("user/.pi/agent/sessions").is_dir());
     let log = fs::read_to_string(root.join("server.log")).unwrap();
     assert!(
         log.contains(
@@ -293,6 +405,8 @@ fn flags_override_environment_and_explicit_skills_are_loaded() {
             "chosen-model",
             "--provider",
             "chosen-provider",
+            "--prepare",
+            "printf 'prepare noise'; export HTTPS_PROXY=http://127.0.0.1:7890",
         ],
         &[("A2ALINKER_AGENT", "codex"), ("A2ALINKER_NAME", "Bob")],
     );
@@ -304,9 +418,9 @@ fn flags_override_environment_and_explicit_skills_are_loaded() {
     assert_eq!(card["skills"][0]["id"], "dummy");
     server.stop();
     let trace = fs::read_to_string(root.join("trace.jsonl")).unwrap();
-    assert!(trace.contains("--no-skills"));
+    assert!(!trace.contains("--no-skills"));
     assert!(trace.contains("--skill"));
-    assert!(trace.contains("get_commands"));
+    assert!(trace.contains(root.join("project/custom-skills").to_str().unwrap()));
     assert!(trace.contains("chosen-model"));
     assert!(trace.contains("chosen-provider"));
 }
@@ -324,6 +438,8 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
             "pi",
             "--name",
             "Alan",
+            "--desc",
+            "Pi 项目开发助手",
             "--storage-dir",
             storage_arg,
             "--listen",
@@ -340,6 +456,8 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
             "codex",
             "--name",
             "Bob",
+            "--desc",
+            "Codex 项目开发助手",
             "--storage-dir",
             storage_arg,
             "--listen",
@@ -368,10 +486,10 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
     assert_ne!(alan_task["id"], bob_task["id"]);
     for name in ["Alan", "Bob"] {
         assert!(storage.join(name).join("a2alinker.db").is_file());
-        assert!(storage.join(name).join("home").is_dir());
+        assert!(!storage.join(name).join("home").exists());
     }
     assert!(!storage.join("a2alinker.db").exists());
-    assert!(storage.join("Alan/sessions").is_dir());
+    assert!(!storage.join("Alan/sessions").exists());
 
     // 同名实例仍竞争同一个目录锁，不能绕过锁创建另一个数据库。
     let mut duplicate = Running::start_with_log(

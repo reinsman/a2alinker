@@ -3,31 +3,28 @@
 //! 子进程的 stdin 用于发送命令，stdout 用于接收协议，stderr 必须单独持续读取。
 //! 本模块还拥有子进程的生命周期：对象被释放时，会清理进程组和后台读取任务。
 
-use std::{collections::VecDeque, process::Stdio};
-
-#[cfg(unix)]
-use nix::{
-    sys::signal::{Signal, killpg},
-    unistd::Pid,
-};
+use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    process::{Child, ChildStdin},
     sync::mpsc,
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use super::AdapterContext;
+use super::{
+    AdapterContext,
+    launch::{self, ProcessGroup},
+};
 
 /// 拥有一个 agent 进程及其通信管道；由单个会话使用，不在多个任务间同时读写。
 pub struct JsonlProcess {
     child: Child,
     // 单独保存进程组 ID：主进程退出后，其启动的工具进程仍可能存活。
-    group_id: Option<u32>,
+    group: ProcessGroup,
     stdin: ChildStdin,
     // 后台读取任务通过有容量上限的通道送入报文，防止内存无限增长。
     incoming: mpsc::Receiver<Result<Value>>,
@@ -40,31 +37,15 @@ pub struct JsonlProcess {
 impl JsonlProcess {
     /// 启动进程并创建管道读取任务。返回 Result，启动失败时由 ? 向上层返回错误。
     pub fn spawn(context: &AdapterContext, args: &[String]) -> Result<Self> {
-        let mut cmd = Command::new(context.options.executable());
-        cmd.args(args)
-            .current_dir(&context.options.agent.workspace)
-            .envs(&context.options.agent.env)
-            .env(
-                match context.options.agent.kind {
-                    crate::options::AgentKind::Pi => "PI_CODING_AGENT_DIR",
-                    crate::options::AgentKind::Codex => "CODEX_HOME",
-                },
-                &context.home,
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        // 0 表示为新子进程建立以其 PID 为 ID 的进程组，便于连同工具进程一起清理。
-        cmd.process_group(0);
+        let mut cmd = launch::command(&context.options)?;
+        cmd.args(args);
         let mut child = cmd.spawn().with_context(|| {
             format!(
-                "cannot spawn agent executable '{}'; check --executable, PATH and the script interpreter (see README.md)",
+                "cannot spawn agent executable '{}'; check --prepare, --executable, PATH and the script interpreter (see README.md)",
                 context.options.executable().display()
             )
         })?;
-        let group_id = child.id();
+        let group = ProcessGroup::new(child.id());
         // 前面已将三个管道设置为 piped，启动成功后这些 Option 必然为 Some。
         // take() 取出管道所有权并把原字段置为 None，之后由本对象或读取任务持有。
         let stdin = child.stdin.take().unwrap();
@@ -101,7 +82,7 @@ impl JsonlProcess {
         });
         Ok(Self {
             child,
-            group_id,
+            group,
             stdin,
             incoming,
             deferred: VecDeque::new(),
@@ -182,7 +163,7 @@ impl JsonlProcess {
         match self.incoming.recv().await {
             Some(result) => result,
             None => bail!(
-                "agent protocol stream closed (process status: {:?})",
+                "agent protocol stream closed (process status: {:?}); check --prepare and --executable if startup failed",
                 self.child.try_wait()?
             ),
         }
@@ -208,16 +189,7 @@ impl JsonlProcess {
 
     /// 尽力终止整个进程组。可重复调用，清理失败时继续尝试终止直接子进程。
     pub fn terminate(&mut self) {
-        #[cfg(unix)]
-        if let Some(id) = self.group_id.take() {
-            // 使用 nix 的安全封装，避免直接调用需要 unsafe 的 libc 接口。
-            // 拒绝特殊组号和有损整数转换，确保不会误把 0 或负数作为目标。
-            if let Ok(raw_id) = i32::try_from(id)
-                && raw_id > 1
-            {
-                let _ = killpg(Pid::from_raw(raw_id), Signal::SIGKILL);
-            }
-        }
+        self.group.terminate();
         let _ = self.child.start_kill();
     }
 }

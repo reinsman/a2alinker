@@ -20,7 +20,7 @@ pub struct CodexSession {
 }
 
 impl CodexSession {
-    /// 完成初始化、技能白名单检查和 thread 创建/恢复；模型推理从 run 的 turn/start 开始。
+    /// 初始化原生协议、传入附加技能目录，再创建或恢复 thread；不改写技能启用设置。
     pub async fn start(context: &AdapterContext, native: Option<&str>) -> Result<Self> {
         let mut args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
         args.extend(context.options.agent.args.clone());
@@ -35,99 +35,14 @@ impl CodexSession {
         process
             .send(json!({"method":"initialized","params":{}}))
             .await?;
-        if let Some(root) = &context.skills.root {
+        if !context.options.skills.directories.is_empty() {
             process
                 .request(
                     "skills/extraRoots/set",
-                    json!({"extraRoots":[canonical(root)?]}),
+                    json!({"extraRoots":context.options.skills.directories}),
                     false,
                 )
                 .await?;
-        }
-        let list = process
-            .request(
-                "skills/list",
-                json!({"cwds":[context.options.agent.workspace],"forceReload":true}),
-                false,
-            )
-            .await?;
-        let expected: Vec<_> = context
-            .skills
-            .skills
-            .iter()
-            .map(|s| canonical(&s.path))
-            .collect::<Result<_>>()?;
-        // 管理模式关闭未选中的技能；继承模式保留原生状态，不擅自启用用户禁用的包。
-        let mut loaded = vec![];
-        for entry in list["data"]
-            .as_array()
-            .context("Codex skills/list missing data")?
-        {
-            for skill in entry["skills"]
-                .as_array()
-                .context("Codex skill list missing skills")?
-            {
-                let path = skill["path"].as_str().context("Codex skill missing path")?;
-                let selected = std::path::Path::new(path)
-                    .canonicalize()
-                    .ok()
-                    .is_some_and(|p| expected.contains(&p));
-                if selected {
-                    loaded.push(path.to_string());
-                }
-                let enabled = if selected {
-                    true
-                } else if context.options.skills.inherit_user {
-                    continue;
-                } else {
-                    false
-                };
-                if skill["enabled"].as_bool() != Some(enabled) {
-                    process
-                        .request(
-                            "skills/config/write",
-                            json!({"path":path,"enabled":enabled}),
-                            false,
-                        )
-                        .await?;
-                }
-            }
-        }
-        ensure!(
-            loaded.len() == expected.len(),
-            "Codex did not discover every selected skill"
-        );
-        if !expected.is_empty() || !context.options.skills.inherit_user {
-            let refreshed = process
-                .request(
-                    "skills/list",
-                    json!({"cwds":[context.options.agent.workspace],"forceReload":true}),
-                    false,
-                )
-                .await?;
-            let mut active = vec![];
-            for entry in refreshed["data"]
-                .as_array()
-                .context("Codex skills/list missing data")?
-            {
-                for skill in entry["skills"]
-                    .as_array()
-                    .context("Codex skill list missing skills")?
-                {
-                    if skill["enabled"] == true {
-                        let path = skill["path"].as_str().context("Codex skill missing path")?;
-                        active.push(canonical(std::path::Path::new(path))?);
-                    }
-                }
-            }
-            ensure!(
-                expected.iter().all(|p| active.contains(p)),
-                "Codex did not enable every selected skill"
-            );
-            ensure!(
-                context.options.skills.inherit_user || active.iter().all(|p| expected.contains(p)),
-                "Codex did not disable inherited skills"
-            );
         }
         let mut params = json!({"cwd":canonical(&context.options.agent.workspace)?});
         if let Some(sandbox) = &context.options.agent.sandbox {
