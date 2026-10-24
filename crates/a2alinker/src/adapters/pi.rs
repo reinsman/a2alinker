@@ -48,6 +48,7 @@ impl PiSession {
         let mut process = JsonlProcess::spawn(context, &args)?;
         let state = process.request("get_state", json!({}), true).await?;
         // 只记录选择的模型标识，不输出可能含端点、请求头等信息的完整 model 对象。
+        #[cfg(feature = "logging")]
         if let Some(model) = state.get("model").filter(|value| value.is_object()) {
             tracing::info!(
                 provider = model["provider"].as_str().unwrap_or("unknown"),

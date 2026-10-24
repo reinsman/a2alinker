@@ -63,9 +63,10 @@ impl std::fmt::Display for ApiError {
 }
 impl std::error::Error for ApiError {}
 impl From<anyhow::Error> for ApiError {
-    fn from(error: anyhow::Error) -> Self {
+    fn from(_error: anyhow::Error) -> Self {
         // 服务端记录详细错误，客户端只得到通用信息，避免暴露内部路径或配置。
-        tracing::error!(error = %error, "gateway operation failed");
+        #[cfg(feature = "logging")]
+        tracing::error!(error = %_error, "gateway operation failed");
         Self {
             code: -32603,
             message: "Internal gateway error; see server logs".into(),
@@ -120,6 +121,7 @@ impl Gateway {
         let storage = options.instance_directory()?;
         // 缺少新实例描述时提前退出，不创建一个空目录影响下次的新旧判断。
         if !storage.try_exists()? && options.identity.description.is_empty() {
+            #[cfg(feature = "logging")]
             tracing::info!(event = "instance.new", name = options.identity.name, storage = %storage.display(), "这是新实例，需要提供 --desc");
             anyhow::bail!("新实例 {} 必须提供 --desc", options.identity.name);
         }
@@ -127,6 +129,7 @@ impl Gateway {
         store
             .prepare_instance(options.agent.kind, &mut options.identity)
             .await?;
+        #[cfg(feature = "logging")]
         tracing::info!(event = "agent.config", agent = options.agent.kind.as_str(),
             workspace = %options.agent.workspace.display(), storage_root = %options.storage.directory.display(), storage = %storage.display(),
             skill_directory_count = options.skills.directories.len(),
@@ -143,6 +146,7 @@ impl Gateway {
         .await
         .context("agent preflight timed out")??;
         drop(preflight);
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "gateway.preflight",
             "原生协议握手与技能预检通过；预检不调用模型，模型账号权限尚未验证"
@@ -214,6 +218,7 @@ impl Gateway {
         let _guard = self.mutation.lock().await;
         if let Some((stored_digest, task_id)) = self.store.duplicate(message.id.as_str()).await? {
             if stored_digest != digest {
+                #[cfg(feature = "logging")]
                 tracing::warn!(
                     event = "message.conflict",
                     message_id = message.id.as_str(),
@@ -225,6 +230,7 @@ impl Gateway {
                 ));
             }
             let task = self.task(&task_id).await?;
+            #[cfg(feature = "logging")]
             tracing::info!(
                 event = "message.duplicate", message_id = message.id.as_str(), task_id,
                 context_id = task.context_id.as_str(), state = %task.status.state,
@@ -253,6 +259,7 @@ impl Gateway {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if self.store.active_context(&context_id).await? {
+            #[cfg(feature = "logging")]
             tracing::warn!(
                 event = "context.busy",
                 context_id,
@@ -262,6 +269,7 @@ impl Gateway {
         }
         // 先预留队列容量再落库，避免创建了一个没有位置入队的任务。
         let permit = self.queue.clone().try_reserve_owned().map_err(|_| {
+            #[cfg(feature = "logging")]
             tracing::warn!(
                 event = "task.queue_full",
                 capacity = self.options.runtime.queue_capacity,
@@ -300,6 +308,7 @@ impl Gateway {
                 replies: receiver,
             },
         );
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "task.queued", message_id = message.id.as_str(), task_id = task.id.as_str(),
             context_id = task.context_id.as_str(), state = %task.status.state, prompt_bytes = prompt.len(),
@@ -371,6 +380,7 @@ impl Gateway {
         self.store
             .record_reply(&task, message, digest, &event)
             .await?;
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "interaction.reply", task_id = id, context_id = task.context_id.as_str(),
             message_id = message.id.as_str(), interaction_id = interaction.id, method = interaction.method,
@@ -406,6 +416,7 @@ impl Gateway {
                 return Ok(task);
             }
             if task.status.state.is_terminal() {
+                #[cfg(feature = "logging")]
                 tracing::warn!(event = "task.cancel_rejected", task_id = id, state = %task.status.state, "CancelTask 被拒绝：任务已进入终态");
                 return Err(ApiError {
                     code: -32002,
@@ -413,6 +424,7 @@ impl Gateway {
                 });
             }
             if let Some(control) = self.controls.lock().await.get(id) {
+                #[cfg(feature = "logging")]
                 tracing::info!(event = "task.cancel_requested", task_id = id, context_id = task.context_id.as_str(), state = %task.status.state, "收到 CancelTask：通知执行器中断任务");
                 control.cancel.cancel();
             } else {
@@ -423,6 +435,7 @@ impl Gateway {
                 let mut task = task;
                 task.status = TaskStatus::new(TaskState::Canceled);
                 self.store.save_event(&task, &status_event(&task)).await?;
+                #[cfg(feature = "logging")]
                 tracing::info!(event = "task.finished", task_id = id, context_id = task.context_id.as_str(), state = %task.status.state, "排队任务已取消并持久化，不会发给 agent 执行");
                 let _ = self.changes.send(());
                 return Ok(task);
@@ -452,6 +465,7 @@ impl Gateway {
         if task.status.state.is_terminal() {
             return Ok(());
         }
+        #[cfg(feature = "logging")]
         let previous_state = task.status.state;
         let protocol_event = match event {
             AgentEvent::OutputDelta { item_id, text } => {
@@ -478,6 +492,7 @@ impl Gateway {
             }
             AgentEvent::Tool(event) => {
                 if !matches!(event.phase, adapters::ToolPhase::Update) {
+                    #[cfg(feature = "logging")]
                     tracing::info!(event = "tool.execution", task_id = id, tool_call_id = event.call_id.as_str(), tool = event.name.as_str(), phase = ?event.phase, "工具执行状态更新；参数和结果通过 A2A 返回，不写入日志");
                 }
                 StreamResponse::StatusUpdate(tool_event(&mut task, event))
@@ -532,6 +547,7 @@ impl Gateway {
             "Task output exceeded max_output_bytes"
         );
         self.store.save_event(&task, &protocol_event).await?;
+        #[cfg(feature = "logging")]
         match &protocol_event {
             StreamResponse::ArtifactUpdate(update) if update.last_chunk => {
                 tracing::info!(
@@ -628,6 +644,7 @@ impl Gateway {
                 }
             }
             self.store.save_event(&task, &status_event(&task)).await?;
+            #[cfg(feature = "logging")]
             if state == TaskState::Failed {
                 tracing::warn!(event = "task.finished", task_id = id, context_id = task.context_id.as_str(), state = %state, "Task 已失败并持久化；通过 GetTask 查看 status.message 中的具体错误");
             } else {
@@ -642,6 +659,7 @@ impl Gateway {
 
     pub async fn shutdown(&self) {
         if !self.shutdown.is_cancelled() {
+            #[cfg(feature = "logging")]
             tracing::info!(
                 event = "gateway.shutdown",
                 "开始关闭网关：取消执行和排队任务，持久化终态并清理 agent 进程"
@@ -743,10 +761,11 @@ async fn worker(
             biased;
             _ = shutdown.cancelled() => break,
             _ = cleanup.tick() => {
-                sessions.retain(|context_id, s| {
+                sessions.retain(|_context_id, s| {
                     let keep = s.used.elapsed().as_secs() < adapter.options.runtime.session_idle_timeout_seconds && s.session.is_alive();
+                    #[cfg(feature = "logging")]
                     if !keep {
-                        tracing::info!(event = "session.released", context_id, native_session_id = s.session.native_id(), "释放空闲或已退出的 agent 会话进程；保留会话文件以便后续恢复");
+                        tracing::info!(event = "session.released", context_id = _context_id, native_session_id = s.session.native_id(), "释放空闲或已退出的 agent 会话进程；保留会话文件以便后续恢复");
                     }
                     keep
                 });
@@ -760,16 +779,19 @@ async fn worker(
         let id = work.task_id.clone();
         let result = execute(&gateway, &adapter, &mut sessions, work).await;
         if let Err(error) = result {
+            #[cfg(feature = "logging")]
             tracing::error!(task_id = %id, error = %error, "task execution failed");
-            if let Err(e) = gateway
+            if let Err(_error) = gateway
                 .finish(&id, TaskState::Failed, Some(error.to_string()))
                 .await
             {
-                tracing::error!(error = %e, "cannot persist failed task");
+                #[cfg(feature = "logging")]
+                tracing::error!(error = %_error, "cannot persist failed task");
             }
         }
     }
     receiver.close();
+    #[cfg(feature = "logging")]
     tracing::info!(
         event = "worker.stopped",
         session_count = sessions.len(),
@@ -793,6 +815,7 @@ async fn execute(
     sessions: &mut HashMap<String, SessionEntry>,
     work: Work,
 ) -> Result<()> {
+    #[cfg(feature = "logging")]
     let started = Instant::now();
     let task = gateway
         .store
@@ -832,6 +855,7 @@ async fn execute(
             .store
             .save_event(&task, &status_event(&task))
             .await?;
+        #[cfg(feature = "logging")]
         tracing::info!(event = "task.started", task_id = work.task_id, context_id, from = "TASK_STATE_SUBMITTED", to = %task.status.state, "worker 取出 Task 开始执行，保存 WORKING 状态");
         let _ = gateway.changes.send(());
     }
@@ -839,6 +863,7 @@ async fn execute(
         .get_mut(&context_id)
         .is_some_and(|entry| !entry.session.is_alive())
     {
+        #[cfg(feature = "logging")]
         tracing::warn!(
             event = "session.unavailable",
             task_id = work.task_id,
@@ -854,6 +879,7 @@ async fn execute(
                 .min_by_key(|(_, s)| s.used)
                 .map(|(id, _)| id.clone())
         {
+            #[cfg(feature = "logging")]
             tracing::info!(
                 event = "session.evicted",
                 context_id = oldest,
@@ -866,6 +892,7 @@ async fn execute(
             .context(&context_id)
             .await?
             .context("context disappeared")?;
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "session.opening",
             task_id = work.task_id,
@@ -892,6 +919,7 @@ async fn execute(
             .store
             .set_native_id(&context_id, session.native_id())
             .await?;
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "session.ready",
             task_id = work.task_id,
@@ -907,6 +935,7 @@ async fn execute(
             },
         );
     } else {
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "session.reused",
             task_id = work.task_id,
@@ -916,6 +945,7 @@ async fn execute(
         );
     }
     let result = {
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "agent.run",
             task_id = work.task_id,
@@ -944,20 +974,24 @@ async fn execute(
                         && let Err(error) = gateway.event(&work.task_id, event).await { break Err(error); }
                 }
                 _ = control.cancel.cancelled(), if !interrupted => {
+                    #[cfg(feature = "logging")]
                     tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, grace_seconds = adapter.options.runtime.cancel_timeout_seconds, "通知原生 agent 中断；超过宽限时间后会释放进程");
                     interrupted = true;
                     deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
                 _ = gateway.shutdown.cancelled(), if !interrupted => {
+                    #[cfg(feature = "logging")]
                     tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, "网关关闭，通知原生 agent 中断当前任务");
                     control.cancel.cancel(); interrupted = true;
                     deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     if interrupted {
+                        #[cfg(feature = "logging")]
                         tracing::warn!(event = "agent.interrupt_timeout", task_id = work.task_id, context_id, "原生中断超过宽限时间，将释放会话并清理进程组");
                         break if timed_out { Err(anyhow!("Task timed out")) } else { Ok(RunOutcome::Canceled) };
                     }
+                    #[cfg(feature = "logging")]
                     tracing::warn!(event = "task.timeout", task_id = work.task_id, context_id, timeout_seconds = adapter.options.runtime.task_timeout_seconds, "任务达到时间上限，先尝试原生中断，再清理进程");
                     timed_out = true; interrupted = true; control.cancel.cancel();
                     deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
@@ -980,6 +1014,7 @@ async fn execute(
     };
     // 失败/取消时释放会话及进程；成功的会话留下以供同一 context 后续任务复用。
     if state != TaskState::Completed {
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "session.released",
             task_id = work.task_id,
@@ -993,6 +1028,7 @@ async fn execute(
     gateway
         .finish(&work.task_id, state, result.err().map(|e| e.to_string()))
         .await?;
+    #[cfg(feature = "logging")]
     tracing::info!(event = "task.execution_end", task_id = work.task_id, context_id, state = %state, elapsed_ms = started.elapsed().as_millis() as u64, "本轮执行已结束；耗时包含会话准备、模型处理和等待交互，不含排队时间");
     Ok(())
 }

@@ -107,6 +107,7 @@ impl JsonlProcess {
     pub async fn request(&mut self, method: &str, params: Value, pi: bool) -> Result<Value> {
         self.next_id += 1;
         let id = format!("linker-{}", self.next_id);
+        #[cfg(feature = "logging")]
         tracing::debug!(
             event = "agent.command",
             native_request_id = id,
@@ -128,6 +129,7 @@ impl JsonlProcess {
             if record.get("id").and_then(Value::as_str) == Some(&id)
                 && (!pi || record["type"] == "response")
             {
+                #[cfg(feature = "logging")]
                 tracing::debug!(
                     event = "agent.response",
                     native_request_id = id,

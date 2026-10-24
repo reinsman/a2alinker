@@ -1,5 +1,5 @@
 //! 启动真实二进制，使用协议替身验证 CLI 默认值、原生继承和端口递增。
-#![cfg(all(unix, feature = "cli"))]
+#![cfg(unix)]
 
 use std::{
     fs::{self, File},
@@ -18,7 +18,8 @@ use nix::{
 use serde_json::{Value, json};
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_agent.py")
+    // 与库的协议测试共用替身，测试不依赖真实 Pi/Codex 或模型服务。
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../a2alinker/tests/fixtures/fake_agent.py")
 }
 
 fn skill(root: &Path, name: &str) {

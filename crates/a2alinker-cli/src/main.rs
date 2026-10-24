@@ -61,10 +61,10 @@ enum Command {
 struct ServeArgs {
     /// Agent 类型；也可通过 --agent 指定。
     #[arg(value_enum, value_name = "AGENT")]
-    backend: Option<AgentKind>,
+    backend: Option<AgentArg>,
     /// Agent 类型，默认 pi；位置参数优先。
     #[arg(long, value_enum, env = "A2ALINKER_AGENT")]
-    agent: Option<AgentKind>,
+    agent: Option<AgentArg>,
     /// 必填的实例名字，也是 Agent Card 名字，例如 Alan、Bob。
     #[arg(long, env = "A2ALINKER_NAME")]
     name: String,
@@ -103,7 +103,39 @@ struct ServeArgs {
     provider: Option<String>,
     /// A2A 认证方式；bearer 凭据通过 A2ALINKER_TOKEN 提供。
     #[arg(long, value_enum, env = "A2ALINKER_AUTH", default_value = "none")]
-    auth: AuthMode,
+    auth: AuthArg,
+}
+
+// 参数枚举只属于命令行包；转换成库的类型后再调用服务 API。
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum AgentArg {
+    #[default]
+    Pi,
+    Codex,
+}
+
+impl From<AgentArg> for AgentKind {
+    fn from(value: AgentArg) -> Self {
+        match value {
+            AgentArg::Pi => Self::Pi,
+            AgentArg::Codex => Self::Codex,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum AuthArg {
+    None,
+    Bearer,
+}
+
+impl From<AuthArg> for AuthMode {
+    fn from(value: AuthArg) -> Self {
+        match value {
+            AuthArg::None => Self::None,
+            AuthArg::Bearer => Self::Bearer,
+        }
+    }
 }
 
 impl Args {
@@ -116,7 +148,7 @@ impl Args {
 impl ServeArgs {
     fn into_options(self) -> Result<Options> {
         let mut options = Options::default();
-        options.agent.kind = self.backend.or(self.agent).unwrap_or_default();
+        options.agent.kind = self.backend.or(self.agent).unwrap_or_default().into();
         options.agent.executable = self
             .executable
             .filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty());
@@ -130,7 +162,7 @@ impl ServeArgs {
         options.server.listen = self.listen;
         options.server.public_url = self.public_url;
         options.storage.directory = self.storage_dir;
-        options.auth.mode = self.auth;
+        options.auth.mode = self.auth.into();
         if options.auth.mode == AuthMode::Bearer {
             options.auth.token = Some(
                 std::env::var("A2ALINKER_TOKEN")

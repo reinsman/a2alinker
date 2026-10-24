@@ -11,7 +11,6 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
- "clap",
  "fs2",
  "futures-util",
  "http-body-util",
@@ -30,6 +29,20 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "a2alinker-cli"
+version = "0.1.0"
+dependencies = [
+ "a2alinker",
+ "anyhow",
+ "clap",
+ "nix",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! 验证教学日志能串起真实协议流程，且不会记录消息、输出正文或环境凭据。
+//! 开启 logging 时验证生命周期日志与隐私，关闭时即使宿主安装订阅器也不产生本包日志。
 
 use crate as a2alinker;
 
@@ -61,7 +61,7 @@ async fn body(response: Response) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn learning_logs_explain_lifecycle_dedup_interaction_and_disconnect_without_payloads() {
+async fn logging_feature_controls_lifecycle_events_without_exposing_payloads() {
     // 全局订阅器覆盖后台 worker；此测试只检查目标流程及敏感内容，不依赖日志数量。
     let writer = LogWriter(Arc::new(Mutex::new(Vec::new())));
     let captured = writer.clone();
@@ -248,6 +248,10 @@ async fn learning_logs_explain_lifecycle_dedup_interaction_and_disconnect_withou
     gateway.shutdown().await;
 
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    if !cfg!(feature = "logging") {
+        assert!(logs.is_empty(), "logging 未启用时不应产生本包日志：{logs}");
+        return;
+    }
     for event in [
         "a2a.discovery",
         "a2a.request",

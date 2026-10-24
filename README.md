@@ -177,29 +177,49 @@ pi confirm 使用上述 `confirmed`；文本输入使用 `value` 或 `cancelled`
 
 ## 作为 Rust 库使用
 
-`src/lib.rs` 是库入口，公开 `Options`、`Server`、`ServerHandle` 等类型；`src/bin/a2alinker.rs` 是独立的二进制入口，`Args` 定义和解析命令行参数，再调用同一套库 API。`options.rs` 定义运行选项、默认值及校验，内部的 A2A 协议、执行器、适配器和存储模块不作为公开 API。
+仓库使用 Cargo workspace 管理两个独立的包。`a2alinker` 是库，公开 `Options`、`Server`、`ServerHandle` 等类型；`a2alinker-cli` 是调用库的命令行程序，生成的二进制仍叫 `a2alinker`。
 
 ```text
-src/
-├── lib.rs
-├── options.rs
-├── server.rs
-├── runtime.rs
-├── storage.rs
-├── a2a/
-├── adapters/
-└── bin/
-    └── a2alinker.rs
+Cargo.toml                     # workspace、公共包信息、构建设置
+Cargo.lock                     # 两个包共用的依赖锁文件
+crates/
+├── a2alinker/
+│   ├── Cargo.toml              # 库依赖，logging 默认关闭
+│   ├── src/
+│   │   ├── lib.rs              # 库入口
+│   │   ├── options.rs          # 运行选项、默认值及校验
+│   │   ├── server.rs           # 服务生命周期 API
+│   │   ├── runtime.rs          # 任务调度与会话管理
+│   │   ├── storage.rs          # 持久化
+│   │   ├── a2a/               # A2A 网络协议
+│   │   └── adapters/          # 原生 agent 适配
+│   └── tests/                  # 库集成测试、内部测试与协议替身
+└── a2alinker-cli/
+    ├── Cargo.toml              # 依赖库并开启 logging，引入 clap 和日志订阅器
+    ├── src/main.rs             # 参数解析、日志初始化、进程信号处理
+    └── tests/cli.rs            # 真实二进制集成测试
 ```
 
-外部 Rust daemon 可以直接依赖库。关闭默认的 `cli` feature 后，不引入 clap 或日志订阅器，日志由宿主 daemon 配置：
+库不依赖 clap；命令行包的 `Args` 定义参数，专属参数枚举转换成库的 `AgentKind`、`AuthMode`，再调用库 API。内部的 A2A 协议、执行器、适配器和存储模块不作为公开 API。
+
+外部 Rust daemon 可以直接依赖库。默认 features 为空，不编译本包的日志事件或 span，也不引入命令行解析和日志订阅器依赖：
 
 ```toml
 [dependencies]
-a2alinker = { path = "../a2alinker", default-features = false }
+a2alinker = { path = "../a2alinker/crates/a2alinker" }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 ```
+
+需要本包日志时，显式启用 `logging`；宿主 daemon 自行配置 tracing 订阅器：
+
+```toml
+a2alinker = { path = "../a2alinker/crates/a2alinker", features = ["logging"] }
+```
+
+库只提供 `logging` feature，默认关闭。命令行包在自己的 `[dependencies]` 中开启库的 `logging`，并自行安装日志订阅器；不再需要 `cli` feature。第三方 daemon 可独立决定是否记录日志，以及使用什么参数解析方式。
+
+关闭 `logging` 仅控制 a2alinker 自身日志；第三方依赖的日志由宿主的过滤规则控制。Cargo feature 在同一个依赖图中会合并，一旦某个依赖方启用 `logging`，其他依赖方不能单独关闭它；运行时可通过宿主的日志过滤器控制输出。
 
 同一个 Tokio 运行时可动态管理多个服务，无需启动 a2alinker 二进制：
 
@@ -243,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
 | `wait().await` | 等待服务退出及清理，取得运行结果；可以在 `select!` 中取消等待后再次等待 |
 | `shutdown().await` | 请求关闭并等待清理，消费句柄；返回后可用同名实例重启 |
 
-丢弃句柄会请求后台关闭，等待清理完成应使用 `shutdown().await` 或 `request_shutdown()` 后 `wait().await`，并保持宿主 Tokio 运行时运行。库不安装进程信号处理器，不初始化全局日志，不修改进程级环境变量；daemon 负责实例注册表、全局信号与管理接口。公开 API 的集成测试位于 `tests/server.rs`，内部协议和进程测试位于 `tests/internal/`。
+丢弃句柄会请求后台关闭，等待清理完成应使用 `shutdown().await` 或 `request_shutdown()` 后 `wait().await`，并保持宿主 Tokio 运行时运行。库不安装进程信号处理器，不初始化全局日志，不修改进程级环境变量；daemon 负责实例注册表、全局信号与管理接口。公开 API 的集成测试位于 `crates/a2alinker/tests/server.rs`，内部协议和进程测试位于 `crates/a2alinker/tests/internal/`。
 
 库的认证凭据直接通过选项传入，每个实例可以使用不同的 token：
 
@@ -254,7 +274,7 @@ options.auth.mode = AuthMode::Bearer;
 options.auth.token = Some("replace-with-your-instance-token-at-least-32-bytes".into());
 ```
 
-只有二进制入口读取 `A2ALINKER_TOKEN` 并转换为上述选项。库不会从环境变量寻找认证凭据，且序列化或 Debug 不输出 `AuthOptions.token`。CLI 默认启用，构建和启动命令保持 `cargo build --release --locked`、`a2alinker serve ...`；多个二进制可继续放在 `src/bin/`，用 `cargo run --bin a2alinker -- serve ...` 选择入口。
+只有二进制入口读取 `A2ALINKER_TOKEN` 并转换为上述选项。库不会从环境变量寻找认证凭据，且序列化或 Debug 不输出 `AuthOptions.token`。在仓库根目录执行 `cargo build --release --locked` 会构建整个 workspace，二进制位于 `target/release/a2alinker`；也可用 `cargo run -p a2alinker-cli -- serve ...` 启动。只构建库时执行 `cargo build -p a2alinker --locked`，不会开启日志或引入命令行依赖。
 
 ## 部署与验证
 
@@ -263,10 +283,15 @@ options.auth.token = Some("replace-with-your-instance-token-at-least-32-bytes".i
 日志写入 stderr；`RUST_LOG=a2alinker=info` 显示中文生命周期日志，`debug` 显示更多事件信息。日志不记录提示词、思考正文、工具参数和输出。TLS 可由反向代理提供，SSE 需要关闭代理缓冲。
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked
-cargo test --all-targets --no-default-features --locked
+cargo fmt --all --check
+cargo clippy -p a2alinker --all-targets --locked -- -D warnings
+cargo clippy -p a2alinker --all-targets --features logging --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test -p a2alinker --all-targets --locked
+cargo test -p a2alinker --all-targets --features logging --locked
+cargo test --workspace --all-targets --locked
 ```
+
+workspace 测试中，命令行包会启用库的日志；上面的两条 `-p a2alinker` 测试分别验证库的默认无日志和显式开启日志的行为。
 
 需要 Rust 1.88+，已安装的 pi / Codex，以及用于测试的 Python 3。集成测试使用独立子进程，不调用真实模型。本包使用 `unsafe_code = "forbid"`，不包含自身的 unsafe 实现。学习笔记保留在本地 `docs/`，不纳入 Git 跟踪。

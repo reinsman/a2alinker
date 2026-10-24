@@ -9,6 +9,7 @@ use anyhow::Result;
 
 pub(super) fn command(options: &Options) -> Result<Command> {
     let mut command = if let Some(prepare) = &options.agent.prepare {
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "agent.prepare",
             agent = options.agent.kind.as_str(),
@@ -51,6 +52,7 @@ exec "${__a2alinker_argv[@]}""#,
             crate::AgentKind::Codex => "CODEX_HOME",
         };
         command.env(key, &directory);
+        #[cfg(feature = "logging")]
         tracing::info!(event = "config.native", agent = options.agent.kind.as_str(), directory = %directory.display(), "直接使用指定的原生配置目录，不复制文件");
     }
     #[cfg(unix)]

@@ -100,8 +100,11 @@ async fn serve(
     gateway: Arc<Gateway>,
     stop: CancellationToken,
 ) -> Result<()> {
+    #[cfg(feature = "logging")]
     let storage = gateway.options.instance_directory()?;
+    #[cfg(feature = "logging")]
     tracing::info!(listen = %gateway.options.server.listen, agent = gateway.options.agent.kind.as_str(), name = gateway.options.identity.name, workspace = %gateway.options.agent.workspace.display(), storage_root = %gateway.options.storage.directory.display(), storage = %storage.display(), "A2A server ready");
+    #[cfg(feature = "logging")]
     tracing::info!(
         event = "a2a.endpoints",
         discovery_url = format!(
@@ -132,6 +135,7 @@ async fn bind_available(mut address: SocketAddr) -> Result<TcpListener> {
                     .port()
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("no available port at or above {}", address.port()))?;
+                #[cfg(feature = "logging")]
                 tracing::info!(listen = %address, next_port = next, "端口已占用，尝试下一个端口");
                 address.set_port(next);
             }

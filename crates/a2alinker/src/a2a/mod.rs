@@ -24,6 +24,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+#[cfg(feature = "logging")]
 use tracing::Instrument;
 
 use crate::{
@@ -122,6 +123,7 @@ pub fn agent_card(gateway: &Gateway) -> AgentCard {
 
 async fn card(State(app): State<App>) -> Response {
     let card = agent_card(&app.gateway);
+    #[cfg(feature = "logging")]
     tracing::info!(
         event = "a2a.discovery",
         protocol_version = "1.0",
@@ -139,8 +141,10 @@ async fn card(State(app): State<App>) -> Response {
 
 // State 是 Axum 的提取器：框架从路由共享状态中取出 App，并解析请求头和请求体。
 async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Response {
+    #[cfg(feature = "logging")]
     let started = tokio::time::Instant::now();
     if !authorized(&headers, app.token_hash.as_ref()) {
+        #[cfg(feature = "logging")]
         tracing::warn!(
             event = "a2a.auth_rejected",
             http_status = 401,
@@ -166,6 +170,7 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
         .unwrap_or("")
         .trim();
     if !["application/json", "application/a2a+json"].contains(&content_type) {
+        #[cfg(feature = "logging")]
         tracing::warn!(
             event = "a2a.content_type_rejected",
             http_status = 415,
@@ -220,23 +225,28 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
     }
     let method = method.unwrap();
     // Instrument 让异步处理期间的日志自动带上请求关联信息，不在 .await 期间持有 enter guard。
+    #[cfg(feature = "logging")]
     let span = tracing::info_span!("a2a_request", request_id = ?id, method);
-    let result = async {
+    let request = async {
+        #[cfg(feature = "logging")]
         tracing::info!(
             event = "a2a.request",
             request_bytes = body.len(),
             "收到 A2A JSON-RPC 请求，开始分派方法"
         );
         dispatch(&app.gateway, &headers, &id, method, params).await
-    }
-    .instrument(span)
-    .await;
+    };
+    #[cfg(feature = "logging")]
+    let request = request.instrument(span);
+    let result = request.await;
     match result {
         Ok(response) => {
+            #[cfg(feature = "logging")]
             let streaming = response
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .is_some_and(|value| value == "text/event-stream");
+            #[cfg(feature = "logging")]
             tracing::info!(
                 event = "a2a.response", request_id = ?id, method,
                 http_status = response.status().as_u16(), streaming,
@@ -339,6 +349,7 @@ async fn dispatch(
             let request: GetTaskRequest = parse(params)?;
             history_length(request.history_length)?;
             let mut task = gateway.task(request.id.as_str()).await?;
+            #[cfg(feature = "logging")]
             tracing::info!(event = "task.query", task_id = task.id.as_str(), context_id = task.context_id.as_str(), state = %task.status.state, "GetTask：读取已保存的任务状态和产物，不发起新的模型调用");
             trim_history(&mut task, request.history_length);
             Ok(success(
@@ -439,6 +450,7 @@ async fn dispatch(
                 page_size: size,
                 total_size: total as i32,
             };
+            #[cfg(feature = "logging")]
             tracing::info!(
                 event = "task.list",
                 returned = response.tasks.len(),
@@ -468,6 +480,7 @@ async fn dispatch(
 }
 
 // 独立拥有此守卫，连接被丢弃时也能记录结束原因；它只观察，不取消任务。
+#[cfg(feature = "logging")]
 struct StreamLog {
     request_id: Value,
     task_id: String,
@@ -476,6 +489,7 @@ struct StreamLog {
     reason: &'static str,
 }
 
+#[cfg(feature = "logging")]
 impl StreamLog {
     fn sent(&mut self) {
         self.events += 1;
@@ -486,6 +500,7 @@ impl StreamLog {
     }
 }
 
+#[cfg(feature = "logging")]
 impl Drop for StreamLog {
     fn drop(&mut self) {
         tracing::info!(
@@ -506,6 +521,7 @@ async fn stream(
     history: Option<i32>,
 ) -> ApiResult<Response> {
     let mut notifications = gateway.subscribe();
+    #[cfg(feature = "logging")]
     let reconnect = cursor.is_some();
     if let Some(cursor) = cursor {
         let prefix = format!("{task_id}:");
@@ -528,11 +544,13 @@ async fn stream(
         .ok_or_else(ApiError::not_found)?;
     trim_history(&mut task, history);
     let initial_terminal = task.status.state.is_terminal();
+    #[cfg(feature = "logging")]
     tracing::info!(
         event = "sse.opened", request_id = ?id, task_id, context_id = task.context_id.as_str(),
         state = %task.status.state, cursor = after, reconnect,
         "建立 SSE 订阅：先发送当前 Task 完整快照，再发送后续事件"
     );
+    #[cfg(feature = "logging")]
     let mut lifecycle = StreamLog {
         request_id: id.clone(),
         task_id: task_id.clone(),
@@ -546,9 +564,14 @@ async fn stream(
     };
     // yield 每次产生一条 SSE；数据库是事件来源，广播通知用于减少轮询延迟。
     let output = async_stream::stream! {
+        #[cfg(feature = "logging")]
         lifecycle.sent();
         yield Ok::<Event, Infallible>(sse_event(&id, &task_id, after, StreamResponse::Task(task)));
-        if initial_terminal { lifecycle.end("task_terminal"); return; }
+        if initial_terminal {
+            #[cfg(feature = "logging")]
+            lifecycle.end("task_terminal");
+            return;
+        }
         loop {
             match gateway.store.events(&task_id, after).await {
                 Ok(events) if !events.is_empty() => {
@@ -557,18 +580,23 @@ async fn stream(
                         if let StreamResponse::Task(task) = &mut event { trim_history(task, history); }
                         let terminal = event.is_terminal();
                         // 客户端可能收到终态后立即断开，必须在 yield 前标记正常结束。
+                        #[cfg(feature = "logging")]
                         if terminal { lifecycle.end("task_terminal"); }
+                        #[cfg(feature = "logging")]
                         lifecycle.sent();
                         yield Ok(sse_event(&id, &task_id, seq, event));
-                        if terminal { lifecycle.end("task_terminal"); return; }
+                        if terminal { return; }
                     }
                 }
                 Ok(_) => {
                     tokio::select! { _ = notifications.recv() => {}, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
                 }
-                Err(error) => {
+                Err(_error) => {
+                    #[cfg(feature = "logging")]
                     lifecycle.end("storage_error");
-                    tracing::error!(error = %error, "SSE event read failed");
+                    #[cfg(feature = "logging")]
+                    tracing::error!(error = %_error, "SSE event read failed");
+                    #[cfg(feature = "logging")]
                     lifecycle.sent();
                     yield Ok(Event::default().data(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"Event stream storage error"}}).to_string()));
                     return;
@@ -582,12 +610,14 @@ async fn stream(
 }
 
 fn sse_event(id: &Value, task_id: &str, seq: i64, event: StreamResponse) -> Event {
+    #[cfg(feature = "logging")]
     let kind = match &event {
         StreamResponse::Task(_) => "task",
         StreamResponse::Message(_) => "message",
         StreamResponse::StatusUpdate(_) => "statusUpdate",
         StreamResponse::ArtifactUpdate(_) => "artifactUpdate",
     };
+    #[cfg(feature = "logging")]
     tracing::debug!(event = "sse.event", request_id = ?id, task_id, cursor = seq, kind, "发送一条 SSE 事件；不记录事件正文");
     Event::default()
         .id(format!("{task_id}:{seq}"))
@@ -616,6 +646,7 @@ fn success(id: &Value, value: Value) -> Response {
 }
 fn error_response(id: Value, error: ApiError) -> Response {
     // 参数错误有时包含客户端原始值，因此日志只记录错误码；详情仍按协议返回调用方。
+    #[cfg(feature = "logging")]
     tracing::warn!(event = "a2a.error", request_id = ?id, rpc_error_code = error.code, "A2A 请求失败：错误详情见 JSON-RPC 响应中的 error");
     Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code,"message":error.message}}))
         .into_response()

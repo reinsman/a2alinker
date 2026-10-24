@@ -98,8 +98,10 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?;
         if saved.is_some() || self.directory_existed {
+            #[cfg(feature = "logging")]
             tracing::info!(event = "instance.existing", name = identity.name, storage = %self.directory.display(), "发现本地已有实例，核对 agent 类型并读取描述");
         } else {
+            #[cfg(feature = "logging")]
             tracing::info!(event = "instance.new", name = identity.name, storage = %self.directory.display(), "这是新实例，将保存 agent 类型和描述");
         }
         if let Some((stored_agent, description)) = saved {
