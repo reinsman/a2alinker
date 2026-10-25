@@ -643,6 +643,75 @@ async fn a2a_wire_protocol_streams_and_supports_task_queries() {
 }
 
 #[tokio::test]
+async fn list_tasks_combines_filters_and_keeps_pagination_and_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let gateway = gateway(&temp, AgentKind::Pi).await;
+    let first = complete(
+        &gateway,
+        Message::user_text("hello").with_context_id("conversation-a"),
+    )
+    .await;
+    let second = complete(
+        &gateway,
+        Message::user_text("hello").with_context_id("conversation-b"),
+    )
+    .await;
+    let router = a2a::router(Arc::clone(&gateway)).unwrap();
+
+    let first_page = rpc(&router, "ListTasks", json!({"pageSize":1})).await;
+    assert_eq!(first_page["result"]["totalSize"], 2);
+    let next_page = rpc(
+        &router,
+        "ListTasks",
+        json!({"pageSize":1,"pageToken":first_page["result"]["nextPageToken"]}),
+    )
+    .await;
+    let listed_ids = [
+        first_page["result"]["tasks"][0]["id"].as_str().unwrap(),
+        next_page["result"]["tasks"][0]["id"].as_str().unwrap(),
+    ];
+    assert!(listed_ids.contains(&first.id.as_str()));
+    assert!(listed_ids.contains(&second.id.as_str()));
+
+    // 时间条件包含等于边界；筛选后再计算分页数量，history/artifacts 选项仍然生效。
+    let filtered = rpc(
+        &router,
+        "ListTasks",
+        json!({
+            "contextId":"conversation-a",
+            "status":"TASK_STATE_COMPLETED",
+            "statusTimestampAfter":first.status.timestamp,
+            "historyLength":0,
+            "includeArtifacts":true
+        }),
+    )
+    .await;
+    assert_eq!(filtered["result"]["totalSize"], 1);
+    let task = &filtered["result"]["tasks"][0];
+    assert_eq!(task["id"], first.id.as_str());
+    assert!(task.get("history").is_none());
+    assert!(!task["artifacts"].as_array().unwrap().is_empty());
+
+    for params in [
+        json!({"contextId":"missing"}),
+        json!({"status":"TASK_STATE_FAILED"}),
+        json!({"statusTimestampAfter":"2999-01-01T00:00:00Z"}),
+    ] {
+        let response = rpc(&router, "ListTasks", params).await;
+        assert_eq!(response["result"]["totalSize"], 0);
+    }
+    for params in [
+        json!({"pageToken":"offset:invalid"}),
+        json!({"pageToken":"offset:3"}),
+        json!({"statusTimestampAfter":"invalid"}),
+    ] {
+        let response = rpc(&router, "ListTasks", params).await;
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn subscriptions_start_with_an_atomic_snapshot_even_with_a_cursor() {
     let temp = tempfile::tempdir().unwrap();
     let g = gateway(&temp, AgentKind::Pi).await;

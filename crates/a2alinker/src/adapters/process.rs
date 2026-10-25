@@ -27,19 +27,19 @@ pub struct JsonlProcess {
     group: ProcessGroup,
     stdin: ChildStdin,
     // 后台读取任务通过有容量上限的通道送入报文，防止内存无限增长。
-    incoming: mpsc::Receiver<Result<Value>>,
+    incoming_messages: mpsc::Receiver<Result<Value>>,
     // 等待命令响应时可能先收到通知；暂存这些通知，随后按原顺序处理。
-    deferred: VecDeque<Value>,
-    next_id: u64,
+    deferred_notifications: VecDeque<Value>,
+    next_request_number: u64,
     readers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl JsonlProcess {
     /// 启动进程并创建管道读取任务。返回 Result，启动失败时由 ? 向上层返回错误。
     pub fn spawn(context: &AdapterContext, args: &[String]) -> Result<Self> {
-        let mut cmd = launch::command(&context.options)?;
-        cmd.args(args);
-        let mut child = cmd.spawn().with_context(|| {
+        let mut command = launch::command(&context.options)?;
+        command.args(args);
+        let mut child = command.spawn().with_context(|| {
             format!(
                 "cannot spawn agent executable '{}'; check --prepare, --executable, PATH and the script interpreter (see README.md)",
                 context.options.executable().display()
@@ -48,10 +48,10 @@ impl JsonlProcess {
         let group = ProcessGroup::new(child.id());
         // 前面已将三个管道设置为 piped，启动成功后这些 Option 必然为 Some。
         // take() 取出管道所有权并把原字段置为 None，之后由本对象或读取任务持有。
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, incoming) = mpsc::channel(128);
+        let stdin = child.stdin.take().expect("agent stdin must be piped");
+        let stdout = child.stdout.take().expect("agent stdout must be piped");
+        let stderr = child.stderr.take().expect("agent stderr must be piped");
+        let (message_sender, incoming_messages) = mpsc::channel(128);
         let limit = context.options.runtime.max_protocol_record_bytes;
         // async move 将管道和发送端的所有权移入后台任务；这里只按换行切分 JSONL。
         let stdout_reader = tokio::spawn(async move {
@@ -62,7 +62,7 @@ impl JsonlProcess {
                     Err(e) => Err(e).context("agent JSONL framing error"),
                 };
                 let failed = value.is_err();
-                if tx.send(value).await.is_err() || failed {
+                if message_sender.send(value).await.is_err() || failed {
                     return;
                 }
             }
@@ -74,8 +74,8 @@ impl JsonlProcess {
                 match reader.fill_buf().await {
                     Ok([]) | Err(_) => break,
                     Ok(buf) => {
-                        let n = buf.len();
-                        reader.consume(n);
+                        let bytes_read = buf.len();
+                        reader.consume(bytes_read);
                     }
                 }
             }
@@ -84,9 +84,9 @@ impl JsonlProcess {
             child,
             group,
             stdin,
-            incoming,
-            deferred: VecDeque::new(),
-            next_id: 0,
+            incoming_messages,
+            deferred_notifications: VecDeque::new(),
+            next_request_number: 0,
             readers: vec![stdout_reader, stderr_reader],
         })
     }
@@ -103,66 +103,77 @@ impl JsonlProcess {
         Ok(())
     }
 
-    /// 发送带唯一 ID 的命令并等待对应响应；中途收到的其他报文会放入 deferred。
-    pub async fn request(&mut self, method: &str, params: Value, pi: bool) -> Result<Value> {
-        self.next_id += 1;
-        let id = format!("linker-{}", self.next_id);
+    /// 发送带唯一 ID 的命令并等待对应响应；中途收到的通知留给 next() 按序处理。
+    pub async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        is_pi_protocol: bool,
+    ) -> Result<Value> {
+        self.next_request_number += 1;
+        // 这是原生协议命令的 ID，与客户端的 JSON-RPC requestId、A2A taskId 分开。
+        let native_request_id = format!("linker-{}", self.next_request_number);
         #[cfg(feature = "logging")]
         tracing::debug!(
             event = "agent.command",
-            native_request_id = id,
+            native_request_id,
             method,
-            protocol = if pi { "pi-rpc" } else { "codex-app-server" },
+            protocol = if is_pi_protocol {
+                "pi-rpc"
+            } else {
+                "codex-app-server"
+            },
             "向原生 agent 发送命令；不记录 params 或提示词"
         );
-        let value = if pi {
-            let mut p = params.as_object().cloned().unwrap_or_default();
-            p.insert("id".into(), json!(id));
-            p.insert("type".into(), json!(method));
-            Value::Object(p)
+        let command_message = if is_pi_protocol {
+            let mut command_fields = params.as_object().cloned().unwrap_or_default();
+            command_fields.insert(String::from("id"), json!(native_request_id));
+            command_fields.insert(String::from("type"), json!(method));
+            Value::Object(command_fields)
         } else {
-            json!({"id": id, "method": method, "params": params})
+            json!({"id": native_request_id, "method": method, "params": params})
         };
-        self.send(value).await?;
+        self.send(command_message).await?;
         loop {
-            let record = self.raw_next().await?;
-            if record.get("id").and_then(Value::as_str) == Some(&id)
-                && (!pi || record["type"] == "response")
-            {
+            let message = self.raw_next().await?;
+            let matches_request =
+                message.get("id").and_then(Value::as_str) == Some(&native_request_id);
+            let is_response = !is_pi_protocol || message["type"] == "response";
+            if matches_request && is_response {
                 #[cfg(feature = "logging")]
                 tracing::debug!(
                     event = "agent.response",
-                    native_request_id = id,
+                    native_request_id,
                     method,
                     "收到匹配的原生协议响应；命令响应不代表整个 A2A Task 已完成"
                 );
-                if pi {
+                if is_pi_protocol {
                     ensure!(
-                        record["success"] == true,
+                        message["success"] == true,
                         "Pi rejected {method}: {}",
-                        record.get("error").unwrap_or(&Value::Null)
+                        message.get("error").unwrap_or(&Value::Null)
                     );
-                    return Ok(record.get("data").cloned().unwrap_or(Value::Null));
+                    return Ok(message.get("data").cloned().unwrap_or(Value::Null));
                 }
-                if record.get("error").is_some() {
-                    bail!("Codex rejected {method}: {}", record["error"]);
+                if message.get("error").is_some() {
+                    bail!("Codex rejected {method}: {}", message["error"]);
                 }
-                return record
+                return message
                     .get("result")
                     .cloned()
                     .context("agent response missing result");
             }
             ensure!(
-                self.deferred.len() < 1024,
+                self.deferred_notifications.len() < 1024,
                 "too many notifications before a command response"
             );
-            self.deferred.push_back(record);
+            self.deferred_notifications.push_back(message);
         }
     }
 
     /// 从读取任务的通道中取一条报文；通道关闭说明协议流已结束。
     async fn raw_next(&mut self) -> Result<Value> {
-        match self.incoming.recv().await {
+        match self.incoming_messages.recv().await {
             Some(result) => result,
             None => bail!(
                 "agent protocol stream closed (process status: {:?}); check --prepare and --executable if startup failed",
@@ -173,8 +184,8 @@ impl JsonlProcess {
 
     /// 优先处理等待响应期间暂存的报文，保证业务事件不会被跳过或乱序。
     pub async fn next(&mut self) -> Result<Value> {
-        match self.deferred.pop_front() {
-            Some(v) => Ok(v),
+        match self.deferred_notifications.pop_front() {
+            Some(message) => Ok(message),
             None => self.raw_next().await,
         }
     }

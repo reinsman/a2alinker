@@ -2,30 +2,43 @@
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use a2alinker::{AgentKind, Options, options::AuthMode};
+use a2alinker::{AgentKind, AuthMode, Options, Server};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 
 // 普通 Rust main 不能直接等待异步操作；此宏创建 Tokio 运行时来执行 async main。
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 日志使用 stderr，避免与命令的标准输出混在一起。RUST_LOG 可覆盖默认级别。
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "a2alinker=info".into()),
-        )
-        .init();
-    let options = Args::parse().into_options()?;
-    let mut server = a2alinker::Server::start(options).await?;
+    init_global_logging();
+
+    let args = Args::parse();
+    let options = args.into_options()?;
+    let mut server = Server::start(options).await?;
+
+    // 服务自行退出时返回运行结果；收到进程信号时，请求关闭并等待资源清理。
+    // wait() 可以被 select! 取消，句柄仍保留在 server 中，shutdown() 能继续等待它。
     tokio::select! {
         result = server.wait() => result,
-        _ = signal() => server.shutdown().await,
+        _ = wait_for_shutdown_signal() => server.shutdown().await,
     }
 }
 
-async fn signal() {
+fn init_global_logging() {
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => EnvFilter::new("a2alinker=info"),
+    };
+
+    // 日志写入 stderr。init() 将订阅器安装到进程全局存储，函数返回后仍然有效。
+    // 全局初始化只在二进制入口执行一次；库只产生日志事件，不安装订阅器。
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
+}
+
+async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -147,11 +160,18 @@ impl Args {
 
 impl ServeArgs {
     fn into_options(self) -> Result<Options> {
+        // 位置参数优先，其次是 --agent（也可来自环境变量），最后默认 Pi。
+        let agent_argument = match self.backend {
+            Some(agent) => agent,
+            None => self.agent.unwrap_or_default(),
+        };
+
         let mut options = Options::default();
-        options.agent.kind = self.backend.or(self.agent).unwrap_or_default().into();
-        options.agent.executable = self
-            .executable
-            .filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty());
+        options.agent.kind = AgentKind::from(agent_argument);
+        options.agent.executable = match self.executable {
+            Some(path) if !path.as_os_str().to_string_lossy().trim().is_empty() => Some(path),
+            _ => None,
+        };
         options.agent.native_config = self.agent_config;
         options.agent.prepare = self.prepare;
         options.agent.workspace = self.workspace;
@@ -162,12 +182,11 @@ impl ServeArgs {
         options.server.listen = self.listen;
         options.server.public_url = self.public_url;
         options.storage.directory = self.storage_dir;
-        options.auth.mode = self.auth.into();
+        options.auth.mode = AuthMode::from(self.auth);
         if options.auth.mode == AuthMode::Bearer {
-            options.auth.token = Some(
-                std::env::var("A2ALINKER_TOKEN")
-                    .context("--auth bearer requires the A2ALINKER_TOKEN environment variable")?,
-            );
+            let token = std::env::var("A2ALINKER_TOKEN")
+                .context("--auth bearer requires the A2ALINKER_TOKEN environment variable")?;
+            options.auth.token = Some(token);
         }
         if !self.skill_dir.is_empty() {
             options.skills.directories = self.skill_dir;
@@ -179,9 +198,9 @@ impl ServeArgs {
 
 fn parse_description(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
-        Err("描述不能为空或只有空白字符".into())
+        Err(String::from("描述不能为空或只有空白字符"))
     } else {
-        Ok(value.into())
+        Ok(String::from(value))
     }
 }
 
@@ -190,8 +209,8 @@ fn parse_listen(value: &str) -> Result<SocketAddr, String> {
         Ok(SocketAddr::from(([127, 0, 0, 1], port)))
     } else {
         value
-            .parse()
-            .map_err(|_| "listen 必须是 0..65535 的端口或 IP:端口".into())
+            .parse::<SocketAddr>()
+            .map_err(|_| String::from("listen 必须是 0..65535 的端口或 IP:端口"))
     }
 }
 

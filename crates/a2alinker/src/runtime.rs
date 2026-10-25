@@ -81,16 +81,18 @@ struct Work {
 }
 struct Control {
     cancel: CancellationToken,
+    // HTTP 请求将审批/输入回复送入此通道。
     replies: mpsc::Sender<InteractionReply>,
 }
 struct QueuedControl {
     cancel: CancellationToken,
+    // 接收端只有一份：从排队表移交给 worker，最终由本轮原生会话读取。
     replies: mpsc::Receiver<InteractionReply>,
 }
 struct SessionEntry {
     // dyn 表示运行时选择具体实现；Box 拥有该会话，释放时会连带清理子进程。
     session: Box<dyn AgentSession>,
-    used: Instant,
+    last_used_at: Instant,
 }
 
 /// Arc 允许路由、请求和后台任务共同持有网关，不会复制整个网关及数据库。
@@ -136,16 +138,18 @@ impl Gateway {
             "直接使用原生配置、认证、技能及会话存储；单个 worker 串行执行任务");
         let options = Arc::new(options);
         let adapter = AdapterContext {
-            options: options.clone(),
+            options: Arc::clone(&options),
         };
         // 正式对外报告就绪前，验证原生协议和选中技能；此时不请求模型推理。
-        let preflight = tokio::time::timeout(
+        let preflight_result = tokio::time::timeout(
             Duration::from_secs(options.runtime.startup_timeout_seconds),
             adapters::create_session(&adapter, None),
         )
         .await
-        .context("agent preflight timed out")??;
-        drop(preflight);
+        .context("agent preflight timed out")?;
+        // 外层检查握手是否超时，内层检查原生会话是否创建成功。
+        let preflight_session = preflight_result?;
+        drop(preflight_session);
         #[cfg(feature = "logging")]
         tracing::info!(
             event = "gateway.preflight",
@@ -171,13 +175,13 @@ impl Gateway {
             }
         }
         // worker 使用 Weak 弱引用，不让空闲后台任务一直维持网关的强引用计数。
-        let handle = tokio::spawn(worker(
+        let worker_task = tokio::spawn(worker(
             Arc::downgrade(&gateway),
             receiver,
             adapter,
             gateway.shutdown.clone(),
         ));
-        *gateway.worker.lock().await = Some(handle);
+        *gateway.worker.lock().await = Some(worker_task);
         Ok(gateway)
     }
 
@@ -210,12 +214,11 @@ impl Gateway {
         {
             return Err(ApiError::invalid("contextId must contain 1..=256 bytes"));
         }
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&message).map_err(anyhow::Error::from)?)
-        );
+        // 摘要包含整条 A2A Message，用于判断相同 messageId 是否是原请求的重试。
+        let message_bytes = serde_json::to_vec(&message).map_err(anyhow::Error::from)?;
+        let digest = format!("{:x}", Sha256::digest(message_bytes));
         // guard 离开作用域时自动释放锁；去重和创建任务必须处于同一临界区。
-        let _guard = self.mutation.lock().await;
+        let _mutation_guard = self.mutation.lock().await;
         if let Some((stored_digest, task_id)) = self.store.duplicate(message.id.as_str()).await? {
             if stored_digest != digest {
                 #[cfg(feature = "logging")]
@@ -254,10 +257,10 @@ impl Gateway {
             .text_content()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| ApiError::invalid("prompt must not be empty"))?;
-        let context_id = message
-            .context_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let context_id = match &message.context_id {
+            Some(context_id) => context_id.clone(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         if self.store.active_context(&context_id).await? {
             #[cfg(feature = "logging")]
             tracing::warn!(
@@ -268,15 +271,19 @@ impl Gateway {
             return Err(ApiError::unsupported("Context already has an active task"));
         }
         // 先预留队列容量再落库，避免创建了一个没有位置入队的任务。
-        let permit = self.queue.clone().try_reserve_owned().map_err(|_| {
-            #[cfg(feature = "logging")]
-            tracing::warn!(
-                event = "task.queue_full",
-                capacity = self.options.runtime.queue_capacity,
-                "任务队列已满，当前消息未创建任务，请稍后重试"
-            );
-            ApiError::unsupported("Task queue is full; retry later")
-        })?;
+        let queue_sender = self.queue.clone();
+        let permit = match queue_sender.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                #[cfg(feature = "logging")]
+                tracing::warn!(
+                    event = "task.queue_full",
+                    capacity = self.options.runtime.queue_capacity,
+                    "任务队列已满，当前消息未创建任务，请稍后重试"
+                );
+                return Err(ApiError::unsupported("Task queue is full; retry later"));
+            }
+        };
         let mut task = Task::new(uuid::Uuid::new_v4().to_string(), context_id);
         task.history.push(
             message
@@ -292,20 +299,20 @@ impl Gateway {
             .insert_task(&task, message.id.as_str(), &digest)
             .await?;
         // Sender 留给 HTTP 回复入口，Receiver 的所有权交给 worker，再交给 agent。
-        let (replies, receiver) = mpsc::channel(1);
+        let (reply_sender, reply_receiver) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         self.controls.lock().await.insert(
             task.id.to_string(),
             Control {
                 cancel: cancel.clone(),
-                replies,
+                replies: reply_sender,
             },
         );
         self.queued.lock().await.insert(
             task.id.to_string(),
             QueuedControl {
                 cancel,
-                replies: receiver,
+                replies: reply_receiver,
             },
         );
         #[cfg(feature = "logging")]
@@ -361,6 +368,7 @@ impl Gateway {
             .ok_or_else(|| ApiError::invalid("Interaction reply missing response"))?;
         adapters::validate_reply(&interaction, response)
             .map_err(|e| ApiError::invalid(e.to_string()))?;
+        // submit() 已持有 mutation 锁；此处延续同一个临界区，并在发送前先保存回复。
         let controls = self.controls.lock().await;
         let control = controls
             .get(id)
@@ -410,7 +418,8 @@ impl Gateway {
 
     pub async fn cancel(&self, id: &str) -> ApiResult<Task> {
         {
-            let _guard = self.mutation.lock().await;
+            // 只在这个代码块内修改状态；退出代码块后先解锁，再等待任务结束。
+            let _mutation_guard = self.mutation.lock().await;
             let task = self.task(id).await?;
             if task.status.state == TaskState::Canceled {
                 return Ok(task);
@@ -460,7 +469,7 @@ impl Gateway {
         {
             return Ok(());
         }
-        let _guard = self.mutation.lock().await;
+        let _mutation_guard = self.mutation.lock().await;
         let mut task = self.store.task(id).await?.context("task disappeared")?;
         if task.status.state.is_terminal() {
             return Ok(());
@@ -607,7 +616,7 @@ impl Gateway {
 
     /// 终态只写入一次；清除待处理交互并释放该任务的控制通道。
     async fn finish(&self, id: &str, state: TaskState, detail: Option<String>) -> Result<()> {
-        let _guard = self.mutation.lock().await;
+        let _mutation_guard = self.mutation.lock().await;
         let mut task = self.store.task(id).await?.context("task disappeared")?;
         if !task.status.state.is_terminal() {
             task.status = match detail {
@@ -667,6 +676,7 @@ impl Gateway {
         }
         self.shutdown.cancel();
         if let Some(worker) = self.worker.lock().await.take() {
+            // take() 取走 JoinHandle 并留下 None；只有取得句柄的调用者负责等待清理。
             let _ = worker.await;
         }
     }
@@ -748,8 +758,8 @@ fn text_event(
 
 // 会话表只由此 worker 持有和修改，因此不需要额外为每个会话加锁。
 async fn worker(
-    weak: Weak<Gateway>,
-    mut receiver: mpsc::Receiver<Work>,
+    gateway_weak: Weak<Gateway>,
+    mut work_receiver: mpsc::Receiver<Work>,
     adapter: AdapterContext,
     shutdown: CancellationToken,
 ) {
@@ -761,28 +771,34 @@ async fn worker(
             biased;
             _ = shutdown.cancelled() => break,
             _ = cleanup.tick() => {
-                sessions.retain(|_context_id, s| {
-                    let keep = s.used.elapsed().as_secs() < adapter.options.runtime.session_idle_timeout_seconds && s.session.is_alive();
+                sessions.retain(|_context_id, entry| {
+                    let within_idle_timeout = entry.last_used_at.elapsed().as_secs()
+                        < adapter.options.runtime.session_idle_timeout_seconds;
+                    let keep = within_idle_timeout && entry.session.is_alive();
                     #[cfg(feature = "logging")]
                     if !keep {
-                        tracing::info!(event = "session.released", context_id = _context_id, native_session_id = s.session.native_id(), "释放空闲或已退出的 agent 会话进程；保留会话文件以便后续恢复");
+                        tracing::info!(event = "session.released", context_id = _context_id, native_session_id = entry.session.native_id(), "释放空闲或已退出的 agent 会话进程；保留会话文件以便后续恢复");
                     }
                     keep
                 });
                 continue;
             }
-            work = receiver.recv() => match work { Some(work) => work, None => break },
+            work = work_receiver.recv() => match work {
+                Some(work) => work,
+                None => break,
+            },
         };
-        let Some(gateway) = weak.upgrade() else {
+        // Weak 本身不维持实例存活；只在执行当前任务期间取得一份强引用。
+        let Some(gateway) = gateway_weak.upgrade() else {
             break;
         };
-        let id = work.task_id.clone();
+        let task_id = work.task_id.clone();
         let result = execute(&gateway, &adapter, &mut sessions, work).await;
         if let Err(error) = result {
             #[cfg(feature = "logging")]
-            tracing::error!(task_id = %id, error = %error, "task execution failed");
+            tracing::error!(task_id = %task_id, error = %error, "task execution failed");
             if let Err(_error) = gateway
-                .finish(&id, TaskState::Failed, Some(error.to_string()))
+                .finish(&task_id, TaskState::Failed, Some(error.to_string()))
                 .await
             {
                 #[cfg(feature = "logging")]
@@ -790,7 +806,7 @@ async fn worker(
             }
         }
     }
-    receiver.close();
+    work_receiver.close();
     #[cfg(feature = "logging")]
     tracing::info!(
         event = "worker.stopped",
@@ -798,11 +814,16 @@ async fn worker(
         "任务执行器停止，清理会话进程和剩余任务"
     );
     sessions.clear();
-    if let Some(gateway) = weak.upgrade() {
-        let ids: Vec<_> = gateway.controls.lock().await.keys().cloned().collect();
-        for id in ids {
+    if let Some(gateway) = gateway_weak.upgrade() {
+        // 收集 ID 后即释放 controls 锁，避免持有它调用同样需要此锁的 finish()。
+        let task_ids: Vec<String> = gateway.controls.lock().await.keys().cloned().collect();
+        for task_id in task_ids {
             let _ = gateway
-                .finish(&id, TaskState::Canceled, Some("Gateway shut down".into()))
+                .finish(
+                    &task_id,
+                    TaskState::Canceled,
+                    Some("Gateway shut down".into()),
+                )
                 .await;
         }
     }
@@ -817,6 +838,7 @@ async fn execute(
 ) -> Result<()> {
     #[cfg(feature = "logging")]
     let started = Instant::now();
+    // 1. 取出排队任务及其控制通道，再在 mutation 锁内将状态切换为 WORKING。
     let task = gateway
         .store
         .task(&work.task_id)
@@ -840,7 +862,7 @@ async fn execute(
             .await;
     }
     {
-        let _guard = gateway.mutation.lock().await;
+        let _mutation_guard = gateway.mutation.lock().await;
         let mut task = gateway
             .store
             .task(&work.task_id)
@@ -859,6 +881,7 @@ async fn execute(
         tracing::info!(event = "task.started", task_id = work.task_id, context_id, from = "TASK_STATE_SUBMITTED", to = %task.status.state, "worker 取出 Task 开始执行，保存 WORKING 状态");
         let _ = gateway.changes.send(());
     }
+    // 2. 根据 contextId 复用会话；进程已退出或缓存超限时释放旧进程。
     if sessions
         .get_mut(&context_id)
         .is_some_and(|entry| !entry.session.is_alive())
@@ -876,8 +899,8 @@ async fn execute(
         if sessions.len() >= adapter.options.runtime.max_sessions
             && let Some(oldest) = sessions
                 .iter()
-                .min_by_key(|(_, s)| s.used)
-                .map(|(id, _)| id.clone())
+                .min_by_key(|(_, entry)| entry.last_used_at)
+                .map(|(context_id, _)| context_id.clone())
         {
             #[cfg(feature = "logging")]
             tracing::info!(
@@ -905,7 +928,7 @@ async fn execute(
             agent = adapter.options.agent.kind.as_str(),
             "为 context 创建或恢复原生会话；A2A contextId 与原生会话标识通过数据库映射"
         );
-        let start = tokio::time::timeout(
+        let startup_future = tokio::time::timeout(
             Duration::from_secs(adapter.options.runtime.startup_timeout_seconds),
             adapters::create_session(adapter, stored.native_id.as_deref()),
         );
@@ -913,7 +936,10 @@ async fn execute(
         let session = tokio::select! {
             _ = control.cancel.cancelled() => return gateway.finish(&work.task_id, TaskState::Canceled, None).await,
             _ = gateway.shutdown.cancelled() => return gateway.finish(&work.task_id, TaskState::Canceled, None).await,
-            session = start => session.context("agent startup timed out")??,
+            startup_result = startup_future => {
+                let session_result = startup_result.context("agent startup timed out")?;
+                session_result?
+            },
         };
         gateway
             .store
@@ -931,7 +957,7 @@ async fn execute(
             context_id.clone(),
             SessionEntry {
                 session,
-                used: Instant::now(),
+                last_used_at: Instant::now(),
             },
         );
     } else {
@@ -944,6 +970,7 @@ async fn execute(
             "复用同一 context 的存活会话，保留对话上下文"
         );
     }
+    // 3. 同时消费原生事件、执行结果、取消信号和超时信号。
     let result = {
         #[cfg(feature = "logging")]
         tracing::info!(
@@ -953,25 +980,31 @@ async fn execute(
             prompt_bytes = work.prompt.len(),
             "向 agent 提交本轮消息，开始接收输出、进度或交互事件；不记录提示词正文"
         );
-        let session = &mut sessions.get_mut(&context_id).unwrap().session;
-        let (events, mut incoming) = mpsc::channel(128);
-        let run = session.run(
+        let session_entry = sessions
+            .get_mut(&context_id)
+            .expect("session must be created or reused before execution");
+        let session = &mut session_entry.session;
+        let (event_sender, mut event_receiver) = mpsc::channel(128);
+        let run_future = session.run(
             &work.prompt,
-            events,
+            event_sender,
             control.replies,
             control.cancel.clone(),
         );
         // Future 固定位置后，可在循环中反复等待同一次 run，而不会重复启动推理。
-        tokio::pin!(run);
+        tokio::pin!(run_future);
         let mut deadline =
             Instant::now() + Duration::from_secs(adapter.options.runtime.task_timeout_seconds);
         let mut interrupted = false;
         let mut timed_out = false;
         loop {
             tokio::select! {
-                event = incoming.recv(), if !incoming.is_closed() || !incoming.is_empty() => {
+                event = event_receiver.recv(), if !event_receiver.is_closed() || !event_receiver.is_empty() => {
                     if let Some(event) = event
-                        && let Err(error) = gateway.event(&work.task_id, event).await { break Err(error); }
+                        && let Err(error) = gateway.event(&work.task_id, event).await
+                    {
+                        break Err(error);
+                    }
                 }
                 _ = control.cancel.cancelled(), if !interrupted => {
                     #[cfg(feature = "logging")]
@@ -982,7 +1015,8 @@ async fn execute(
                 _ = gateway.shutdown.cancelled(), if !interrupted => {
                     #[cfg(feature = "logging")]
                     tracing::info!(event = "agent.interrupt", task_id = work.task_id, context_id, "网关关闭，通知原生 agent 中断当前任务");
-                    control.cancel.cancel(); interrupted = true;
+                    control.cancel.cancel();
+                    interrupted = true;
                     deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
@@ -993,14 +1027,19 @@ async fn execute(
                     }
                     #[cfg(feature = "logging")]
                     tracing::warn!(event = "task.timeout", task_id = work.task_id, context_id, timeout_seconds = adapter.options.runtime.task_timeout_seconds, "任务达到时间上限，先尝试原生中断，再清理进程");
-                    timed_out = true; interrupted = true; control.cancel.cancel();
+                    timed_out = true;
+                    interrupted = true;
+                    control.cancel.cancel();
                     deadline = Instant::now() + Duration::from_secs(adapter.options.runtime.cancel_timeout_seconds);
                 }
-                result = &mut run => {
+                result = &mut run_future => {
                     let mut result = result;
                     // run 完成时通道中可能还有最后几条事件，先处理完，再写终态。
-                    while let Ok(event) = incoming.try_recv() {
-                        if let Err(error) = gateway.event(&work.task_id, event).await { result = Err(error); break; }
+                    while let Ok(event) = event_receiver.try_recv() {
+                        if let Err(error) = gateway.event(&work.task_id, event).await {
+                            result = Err(error);
+                            break;
+                        }
                     }
                     break if timed_out { Err(anyhow!("Task timed out")) } else { result };
                 }
@@ -1012,7 +1051,7 @@ async fn execute(
         Ok(RunOutcome::Canceled) => TaskState::Canceled,
         Err(_) => TaskState::Failed,
     };
-    // 失败/取消时释放会话及进程；成功的会话留下以供同一 context 后续任务复用。
+    // 4. 失败/取消时释放会话及进程；成功的会话留下以供同一 context 后续任务复用。
     if state != TaskState::Completed {
         #[cfg(feature = "logging")]
         tracing::info!(
@@ -1023,11 +1062,13 @@ async fn execute(
         );
         sessions.remove(&context_id);
     } else if let Some(session) = sessions.get_mut(&context_id) {
-        session.used = Instant::now();
+        session.last_used_at = Instant::now();
     }
-    gateway
-        .finish(&work.task_id, state, result.err().map(|e| e.to_string()))
-        .await?;
+    let error_detail = match result {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    gateway.finish(&work.task_id, state, error_detail).await?;
     #[cfg(feature = "logging")]
     tracing::info!(event = "task.execution_end", task_id = work.task_id, context_id, state = %state, elapsed_ms = started.elapsed().as_millis() as u64, "本轮执行已结束；耗时包含会话准备、模型处理和等待交互，不含排队时间");
     Ok(())

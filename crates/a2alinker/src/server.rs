@@ -32,7 +32,8 @@ impl Server {
         let address = listener.local_addr()?;
         options.server.listen = address;
         let gateway = Gateway::open(options).await?;
-        let router = match a2a::router(gateway.clone()) {
+        // 路由和后台服务共享同一个实例；Arc::clone 不复制实例及数据库。
+        let router = match a2a::router(Arc::clone(&gateway)) {
             Ok(router) => router,
             Err(error) => {
                 gateway.shutdown().await;
@@ -41,6 +42,7 @@ impl Server {
         };
         let name = gateway.options.identity.name.clone();
         let stop = CancellationToken::new();
+        // 后台任务取得 listener、router 和 gateway 的所有权；句柄保留关闭信号和 JoinHandle。
         let task = tokio::spawn(serve(listener, router, gateway, stop.clone()));
         Ok(ServerHandle {
             name,
@@ -62,7 +64,10 @@ impl ServerHandle {
 
     /// 表示服务后台任务已退出，不代表上游模型账号或网络是否可用。
     pub fn is_finished(&self) -> bool {
-        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+        match &self.task {
+            Some(task) => task.is_finished(),
+            None => true,
+        }
     }
 
     /// 只发出关闭请求；可重复调用，不阻塞 daemon 的管理循环。
@@ -76,9 +81,15 @@ impl ServerHandle {
         let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
-        let result = task.await.context("A2A service task failed");
+        // 只借用句柄来等待；如果 select! 取消了等待，self.task 仍保留原句柄。
+        // 不能提前 take() 取走它，否则调用方无法再次等待同一个后台任务。
+        let task_result = task.await;
         self.task = None;
-        result?
+        // 外层 Result 表示后台任务是否正常返回，内层 Result 是服务自身的运行结果。
+        match task_result {
+            Ok(service_result) => service_result,
+            Err(error) => Err(error).context("A2A service task failed"),
+        }
     }
 
     /// 请求关闭并等待清理；返回后可用同一个名字重新启动实例。
@@ -90,6 +101,7 @@ impl ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
+        // Drop 不能 await；这里只发出信号，确认清理完成仍需显式调用 shutdown().await。
         self.stop.cancel();
     }
 }
@@ -114,14 +126,16 @@ async fn serve(
         rpc_url = format!("{}/a2a", gateway.options.public_url()),
         "GET Agent Card 发现能力，POST /a2a 提交消息；流式调用使用 SSE"
     );
-    let stopping = gateway.clone();
+    let stopping = Arc::clone(&gateway);
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             stop.cancelled().await;
+            // 先停止实例内的任务与原生进程，再等待 HTTP 服务结束。
             stopping.shutdown().await;
         })
         .await;
     gateway.shutdown().await;
+    // 关闭连接池后 wait()/shutdown() 才返回，调用方随后可以重新启动同名实例。
     gateway.store.close().await;
     result.context("A2A server failed")
 }

@@ -51,7 +51,7 @@ pub struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
-            listen: "127.0.0.1:10100".parse().unwrap(),
+            listen: SocketAddr::from(([127, 0, 0, 1], 10100)),
             public_url: None,
             max_request_bytes: 1024 * 1024,
         }
@@ -68,8 +68,8 @@ pub struct IdentityOptions {
 impl Default for IdentityOptions {
     fn default() -> Self {
         Self {
-            name: "Alan".into(),
-            description: "A local coding agent exposed through A2A".into(),
+            name: String::from("Alan"),
+            description: String::from("A local coding agent exposed through A2A"),
         }
     }
 }
@@ -101,7 +101,7 @@ impl Default for AgentOptions {
             executable: None,
             prepare: None,
             native_config: None,
-            workspace: ".".into(),
+            workspace: PathBuf::from("."),
             model: None,
             provider: None,
             args: vec![],
@@ -164,7 +164,7 @@ pub struct StorageOptions {
 impl Default for StorageOptions {
     fn default() -> Self {
         Self {
-            directory: "~/.rein/storage".into(),
+            directory: PathBuf::from("~/.rein/storage"),
         }
     }
 }
@@ -214,7 +214,8 @@ impl Options {
 
     /// 路径统一相对当前进程目录解析，不读取 a2alinker 配置文件。
     pub fn resolve(&mut self) -> Result<()> {
-        self.resolve_paths(&std::env::current_dir()?)?;
+        let current_directory = std::env::current_dir()?;
+        self.resolve_paths(&current_directory)?;
         self.validate()
     }
 
@@ -265,11 +266,11 @@ impl Options {
             self.agent.workspace.display()
         );
         self.native_config_directory()?;
-        for p in &self.skills.directories {
+        for directory in &self.skills.directories {
             ensure!(
-                p.is_dir(),
+                directory.is_dir(),
                 "skill directory does not exist: {}",
-                p.display()
+                directory.display()
             );
         }
         ensure!(
@@ -309,16 +310,16 @@ impl Options {
                 "non-loopback listeners require bearer authentication"
             );
         }
-        if let Some(u) = &self.server.public_url {
-            let u = url::Url::parse(u).context("invalid public_url")?;
+        if let Some(public_url) = &self.server.public_url {
+            let parsed_url = url::Url::parse(public_url).context("invalid public_url")?;
             ensure!(
-                matches!(u.scheme(), "http" | "https")
-                    && u.host().is_some()
-                    && u.username().is_empty()
-                    && u.password().is_none()
-                    && u.query().is_none()
-                    && u.fragment().is_none()
-                    && u.path() == "/",
+                matches!(parsed_url.scheme(), "http" | "https")
+                    && parsed_url.host().is_some()
+                    && parsed_url.username().is_empty()
+                    && parsed_url.password().is_none()
+                    && parsed_url.query().is_none()
+                    && parsed_url.fragment().is_none()
+                    && parsed_url.path() == "/",
                 "public_url must be an http(s) origin without credentials, path, query or fragment"
             );
         }
@@ -346,12 +347,13 @@ impl Options {
     }
 
     pub fn executable(&self) -> PathBuf {
-        self.agent
-            .executable
-            .as_ref()
-            .filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| self.agent.kind.as_str().into())
+        if let Some(path) = &self.agent.executable
+            && !path.as_os_str().to_string_lossy().trim().is_empty()
+        {
+            return path.clone();
+        }
+        // 只返回程序名时，由子进程启动环境中的 PATH 查找实际可执行文件。
+        PathBuf::from(self.agent.kind.as_str())
     }
 
     /// 只处理显式指定的配置，不探测或读取默认配置，也不读取认证文件。
@@ -377,20 +379,18 @@ impl Options {
             "--agent-config for {} must be a directory or a file named {filename}; files are used directly, not copied or renamed",
             self.agent.kind.as_str()
         );
-        Ok(Some(
-            path.parent()
-                .context("native configuration has no parent directory")?
-                .to_path_buf(),
-        ))
+        let directory = path
+            .parent()
+            .context("native configuration has no parent directory")?;
+        Ok(Some(directory.to_path_buf()))
     }
 
     pub fn public_url(&self) -> String {
-        self.server
-            .public_url
-            .clone()
-            .unwrap_or_else(|| format!("http://{}", self.server.listen))
-            .trim_end_matches('/')
-            .into()
+        let public_url = match &self.server.public_url {
+            Some(public_url) => public_url.clone(),
+            None => format!("http://{}", self.server.listen),
+        };
+        String::from(public_url.trim_end_matches('/'))
     }
 }
 
@@ -403,7 +403,7 @@ pub fn absolute(path: &Path, base: &Path) -> Result<PathBuf> {
         bail!("only ~ and ~/ paths are supported");
     }
     Ok(if path.is_absolute() {
-        path.into()
+        path.to_path_buf()
     } else {
         base.join(path)
     })

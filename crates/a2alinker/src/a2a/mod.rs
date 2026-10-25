@@ -52,7 +52,8 @@ pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
             token.len() >= 32,
             "bearer token must contain at least 32 bytes"
         );
-        Some(Sha256::digest(token.as_bytes()).into())
+        let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        Some(token_hash)
     } else {
         None
     };
@@ -69,12 +70,12 @@ pub fn router(gateway: Arc<Gateway>) -> Result<Router> {
 }
 
 pub fn agent_card(gateway: &Gateway) -> AgentCard {
-    let cfg = &gateway.options;
+    let options = &gateway.options;
     let mut card = AgentCard::new(
-        &cfg.identity.name,
-        &cfg.identity.description,
+        &options.identity.name,
+        &options.identity.description,
         vec![AgentInterface::new(
-            format!("{}/a2a", cfg.public_url()),
+            format!("{}/a2a", options.public_url()),
             "JSONRPC".into(),
         )],
     );
@@ -88,16 +89,16 @@ pub fn agent_card(gateway: &Gateway) -> AgentCard {
         required: false,
         params: None,
     }];
-    if cfg.agent.kind == crate::options::AgentKind::Pi
-        && (cfg.runtime.forward_reasoning || cfg.runtime.forward_tools)
+    if options.agent.kind == crate::options::AgentKind::Pi
+        && (options.runtime.forward_reasoning || options.runtime.forward_tools)
     {
         card.capabilities.extensions.push(AgentExtension {
             uri: EXECUTION_EXTENSION.into(),
             description: Some("Public reasoning and structured tool execution".into()),
             required: false,
             params: Some(HashMap::from([
-                ("reasoning".into(), json!(cfg.runtime.forward_reasoning)),
-                ("tools".into(), json!(cfg.runtime.forward_tools)),
+                ("reasoning".into(), json!(options.runtime.forward_reasoning)),
+                ("tools".into(), json!(options.runtime.forward_tools)),
             ])),
         });
     }
@@ -109,7 +110,7 @@ pub fn agent_card(gateway: &Gateway) -> AgentCard {
         "此 Agent 未提供具体能力清单，请通过消息询问。",
         vec!["unspecified".into()],
     )];
-    if cfg.auth.mode == AuthMode::Bearer {
+    if options.auth.mode == AuthMode::Bearer {
         card.security_schemes.insert(
             "bearer".into(),
             SecurityScheme::Http(HttpAuthSecurityScheme::bearer()),
@@ -161,14 +162,11 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
         return response;
     }
     // 限定 JSON 内容类型，阻止浏览器以跨域简单表单请求直接提交 RPC。
-    let content_type = headers
+    let content_type_header = headers
         .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim();
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let content_type = content_type_header.split(';').next().unwrap_or("").trim();
     if !["application/json", "application/a2a+json"].contains(&content_type) {
         #[cfg(feature = "logging")]
         tracing::warn!(
@@ -179,7 +177,7 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
     let request: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
+        Ok(request) => request,
         Err(_) => {
             return error_response(
                 Value::Null,
@@ -190,12 +188,15 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
             );
         }
     };
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let request_id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str);
     if request["jsonrpc"] != "2.0"
         || method.is_none()
         || request.get("id").is_none()
-        || !(id.is_null() || id.is_string() || id.is_i64() || id.is_u64())
+        || !(request_id.is_null()
+            || request_id.is_string()
+            || request_id.is_i64()
+            || request_id.is_u64())
     {
         return error_response(
             Value::Null,
@@ -209,7 +210,7 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
         && !matches!(version.to_str(), Ok("1.0" | "1.0.0"))
     {
         return error_response(
-            id,
+            request_id,
             ApiError {
                 code: -32010,
                 message: "Only A2A 1.0 is supported".into(),
@@ -219,14 +220,14 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     if params.get("tenant").is_some_and(|v| v.as_str() != Some("")) {
         return error_response(
-            id,
+            request_id,
             ApiError::unsupported("This instance does not support tenants"),
         );
     }
-    let method = method.unwrap();
+    let method = method.expect("JSON-RPC method must be validated before dispatch");
     // Instrument 让异步处理期间的日志自动带上请求关联信息，不在 .await 期间持有 enter guard。
     #[cfg(feature = "logging")]
-    let span = tracing::info_span!("a2a_request", request_id = ?id, method);
+    let span = tracing::info_span!("a2a_request", request_id = ?request_id, method);
     let request = async {
         #[cfg(feature = "logging")]
         tracing::info!(
@@ -234,7 +235,7 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
             request_bytes = body.len(),
             "收到 A2A JSON-RPC 请求，开始分派方法"
         );
-        dispatch(&app.gateway, &headers, &id, method, params).await
+        dispatch(&app.gateway, &headers, &request_id, method, params).await
     };
     #[cfg(feature = "logging")]
     let request = request.instrument(span);
@@ -248,14 +249,14 @@ async fn rpc(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Respons
                 .is_some_and(|value| value == "text/event-stream");
             #[cfg(feature = "logging")]
             tracing::info!(
-                event = "a2a.response", request_id = ?id, method,
+                event = "a2a.response", request_id = ?request_id, method,
                 http_status = response.status().as_u16(), streaming,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "A2A HTTP 响应已返回；streaming=true 时任务结果继续通过 SSE 发送"
             );
             response
         }
-        Err(e) => error_response(id, e),
+        Err(error) => error_response(request_id, error),
     }
 }
 
@@ -265,21 +266,24 @@ fn authorized(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
     let Some(expected) = expected else {
         return true;
     };
-    let Some(token) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    else {
+    let Some(authorization) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(authorization) = authorization.to_str() else {
+        return false;
+    };
+    let Some(token) = authorization.strip_prefix("Bearer ") else {
         return false;
     };
     let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    actual.ct_eq(expected).into()
+    // 先做常量时间比较，再将比较结果转成 bool；不直接用普通字节数组相等判断。
+    bool::from(actual.ct_eq(expected))
 }
 
 async fn dispatch(
     gateway: &Arc<Gateway>,
     headers: &HeaderMap,
-    id: &Value,
+    request_id: &Value,
     method: &str,
     params: Value,
 ) -> ApiResult<Response> {
@@ -329,8 +333,8 @@ async fn dispatch(
             let task = gateway.submit(request.message).await?;
             if method == "SendStreamingMessage" {
                 return stream(
-                    gateway.clone(),
-                    id.clone(),
+                    Arc::clone(gateway),
+                    request_id.clone(),
                     task.id.to_string(),
                     None,
                     options.history_length,
@@ -343,7 +347,7 @@ async fn dispatch(
                 gateway.wait(task.id.as_str(), true).await?
             };
             trim_history(&mut task, options.history_length);
-            Ok(success(id, json!({"task":task})))
+            Ok(success(request_id, json!({"task":task})))
         }
         "GetTask" => {
             let request: GetTaskRequest = parse(params)?;
@@ -353,14 +357,14 @@ async fn dispatch(
             tracing::info!(event = "task.query", task_id = task.id.as_str(), context_id = task.context_id.as_str(), state = %task.status.state, "GetTask：读取已保存的任务状态和产物，不发起新的模型调用");
             trim_history(&mut task, request.history_length);
             Ok(success(
-                id,
+                request_id,
                 serde_json::to_value(task).map_err(anyhow::Error::from)?,
             ))
         }
         "CancelTask" => {
             let request: CancelTaskRequest = parse(params)?;
             Ok(success(
-                id,
+                request_id,
                 serde_json::to_value(gateway.cancel(request.id.as_str()).await?)
                     .map_err(anyhow::Error::from)?,
             ))
@@ -371,14 +375,18 @@ async fn dispatch(
             if task.status.state.is_terminal() {
                 return Err(ApiError::unsupported("Use GetTask for a terminal task"));
             }
-            let cursor = headers
-                .get("last-event-id")
-                .map(|v| v.to_str().map(str::to_owned))
-                .transpose()
-                .map_err(|_| ApiError::invalid("Invalid Last-Event-ID"))?;
+            let cursor = match headers.get("last-event-id") {
+                Some(value) => {
+                    let cursor = value
+                        .to_str()
+                        .map_err(|_| ApiError::invalid("Invalid Last-Event-ID"))?;
+                    Some(String::from(cursor))
+                }
+                None => None,
+            };
             stream(
-                gateway.clone(),
-                id.clone(),
+                Arc::clone(gateway),
+                request_id.clone(),
                 request.id.to_string(),
                 cursor,
                 None,
@@ -388,8 +396,8 @@ async fn dispatch(
         "ListTasks" => {
             let request: ListTasksRequest = parse(params)?;
             history_length(request.history_length)?;
-            let size = request.page_size.unwrap_or(50);
-            if !(1..=100).contains(&size) {
+            let page_size = request.page_size.unwrap_or(50);
+            if !(1..=100).contains(&page_size) {
                 return Err(ApiError::invalid("pageSize must be 1..=100"));
             }
             let offset = match request.page_token.as_deref().filter(|s| !s.is_empty()) {
@@ -399,28 +407,40 @@ async fn dispatch(
                     .ok_or_else(|| ApiError::invalid("Invalid pageToken"))?,
                 None => 0,
             };
-            let after = request
-                .status_timestamp_after
-                .as_deref()
-                .map(chrono::DateTime::parse_from_rfc3339)
-                .transpose()
-                .map_err(|_| ApiError::invalid("Invalid statusTimestampAfter"))?;
+            let updated_after = match request.status_timestamp_after.as_deref() {
+                Some(value) => {
+                    let timestamp = chrono::DateTime::parse_from_rfc3339(value)
+                        .map_err(|_| ApiError::invalid("Invalid statusTimestampAfter"))?;
+                    Some(timestamp)
+                }
+                None => None,
+            };
             let tasks = gateway.store.tasks().await?;
             let filtered: Vec<_> = tasks
                 .into_iter()
                 .filter(|task| {
-                    request
-                        .context_id
-                        .as_ref()
-                        .is_none_or(|id| id == task.context_id.as_str())
-                        && request.status.is_none_or(|s| s == task.status.state)
-                        && after.as_ref().is_none_or(|after| {
-                            task.status
-                                .timestamp
-                                .as_deref()
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                                .is_some_and(|t| t >= *after)
-                        })
+                    if let Some(context_id) = &request.context_id
+                        && context_id != task.context_id.as_str()
+                    {
+                        return false;
+                    }
+                    if let Some(state) = request.status
+                        && state != task.status.state
+                    {
+                        return false;
+                    }
+                    let Some(updated_after) = &updated_after else {
+                        return true;
+                    };
+                    let timestamp = task
+                        .status
+                        .timestamp
+                        .as_deref()
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+                    match timestamp {
+                        Some(timestamp) => timestamp >= *updated_after,
+                        None => false,
+                    }
                 })
                 .collect();
             if offset > filtered.len() {
@@ -430,13 +450,13 @@ async fn dispatch(
             let tasks = filtered
                 .into_iter()
                 .skip(offset)
-                .take(size as usize)
-                .map(|mut t| {
-                    trim_history(&mut t, request.history_length);
+                .take(page_size as usize)
+                .map(|mut task| {
+                    trim_history(&mut task, request.history_length);
                     if request.include_artifacts != Some(true) {
-                        t.artifacts.clear();
+                        task.artifacts.clear();
                     }
-                    t
+                    task
                 })
                 .collect::<Vec<_>>();
             let next = offset + tasks.len();
@@ -447,7 +467,7 @@ async fn dispatch(
                 } else {
                     String::new()
                 },
-                page_size: size,
+                page_size,
                 total_size: total as i32,
             };
             #[cfg(feature = "logging")]
@@ -458,7 +478,7 @@ async fn dispatch(
                 "ListTasks：返回符合筛选条件的任务列表"
             );
             Ok(success(
-                id,
+                request_id,
                 serde_json::to_value(response).map_err(anyhow::Error::from)?,
             ))
         }
@@ -515,7 +535,7 @@ impl Drop for StreamLog {
 // 响应流被丢弃只会结束订阅；真正的任务由 Gateway 和 worker 持有，继续执行。
 async fn stream(
     gateway: Arc<Gateway>,
-    id: Value,
+    request_id: Value,
     task_id: String,
     cursor: Option<String>,
     history: Option<i32>,
@@ -546,13 +566,13 @@ async fn stream(
     let initial_terminal = task.status.state.is_terminal();
     #[cfg(feature = "logging")]
     tracing::info!(
-        event = "sse.opened", request_id = ?id, task_id, context_id = task.context_id.as_str(),
+        event = "sse.opened", request_id = ?request_id, task_id, context_id = task.context_id.as_str(),
         state = %task.status.state, cursor = after, reconnect,
         "建立 SSE 订阅：先发送当前 Task 完整快照，再发送后续事件"
     );
     #[cfg(feature = "logging")]
     let mut lifecycle = StreamLog {
-        request_id: id.clone(),
+        request_id: request_id.clone(),
         task_id: task_id.clone(),
         started: tokio::time::Instant::now(),
         events: 0,
@@ -566,7 +586,7 @@ async fn stream(
     let output = async_stream::stream! {
         #[cfg(feature = "logging")]
         lifecycle.sent();
-        yield Ok::<Event, Infallible>(sse_event(&id, &task_id, after, StreamResponse::Task(task)));
+        yield Ok::<Event, Infallible>(sse_event(&request_id, &task_id, after, StreamResponse::Task(task)));
         if initial_terminal {
             #[cfg(feature = "logging")]
             lifecycle.end("task_terminal");
@@ -577,19 +597,28 @@ async fn stream(
                 Ok(events) if !events.is_empty() => {
                     for (seq, mut event) in events {
                         after = seq;
-                        if let StreamResponse::Task(task) = &mut event { trim_history(task, history); }
+                        if let StreamResponse::Task(task) = &mut event {
+                            trim_history(task, history);
+                        }
                         let terminal = event.is_terminal();
                         // 客户端可能收到终态后立即断开，必须在 yield 前标记正常结束。
                         #[cfg(feature = "logging")]
-                        if terminal { lifecycle.end("task_terminal"); }
+                        if terminal {
+                            lifecycle.end("task_terminal");
+                        }
                         #[cfg(feature = "logging")]
                         lifecycle.sent();
-                        yield Ok(sse_event(&id, &task_id, seq, event));
-                        if terminal { return; }
+                        yield Ok(sse_event(&request_id, &task_id, seq, event));
+                        if terminal {
+                            return;
+                        }
                     }
                 }
                 Ok(_) => {
-                    tokio::select! { _ = notifications.recv() => {}, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+                    tokio::select! {
+                        _ = notifications.recv() => {},
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    }
                 }
                 Err(_error) => {
                     #[cfg(feature = "logging")]
@@ -598,7 +627,7 @@ async fn stream(
                     tracing::error!(error = %_error, "SSE event read failed");
                     #[cfg(feature = "logging")]
                     lifecycle.sent();
-                    yield Ok(Event::default().data(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"Event stream storage error"}}).to_string()));
+                    yield Ok(Event::default().data(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32603,"message":"Event stream storage error"}}).to_string()));
                     return;
                 }
             }
@@ -609,7 +638,7 @@ async fn stream(
         .into_response())
 }
 
-fn sse_event(id: &Value, task_id: &str, seq: i64, event: StreamResponse) -> Event {
+fn sse_event(request_id: &Value, task_id: &str, seq: i64, event: StreamResponse) -> Event {
     #[cfg(feature = "logging")]
     let kind = match &event {
         StreamResponse::Task(_) => "task",
@@ -618,10 +647,10 @@ fn sse_event(id: &Value, task_id: &str, seq: i64, event: StreamResponse) -> Even
         StreamResponse::ArtifactUpdate(_) => "artifactUpdate",
     };
     #[cfg(feature = "logging")]
-    tracing::debug!(event = "sse.event", request_id = ?id, task_id, cursor = seq, kind, "发送一条 SSE 事件；不记录事件正文");
+    tracing::debug!(event = "sse.event", request_id = ?request_id, task_id, cursor = seq, kind, "发送一条 SSE 事件；不记录事件正文");
     Event::default()
         .id(format!("{task_id}:{seq}"))
-        .data(json!({"jsonrpc":"2.0","id":id,"result":event}).to_string())
+        .data(json!({"jsonrpc":"2.0","id":request_id,"result":event}).to_string())
 }
 
 fn has_interaction_extension(headers: &HeaderMap) -> bool {
@@ -641,14 +670,14 @@ fn history_length(n: Option<i32>) -> ApiResult<()> {
         Ok(())
     }
 }
-fn success(id: &Value, value: Value) -> Response {
-    Json(json!({"jsonrpc":"2.0","id":id,"result":value})).into_response()
+fn success(request_id: &Value, value: Value) -> Response {
+    Json(json!({"jsonrpc":"2.0","id":request_id,"result":value})).into_response()
 }
-fn error_response(id: Value, error: ApiError) -> Response {
+fn error_response(request_id: Value, error: ApiError) -> Response {
     // 参数错误有时包含客户端原始值，因此日志只记录错误码；详情仍按协议返回调用方。
     #[cfg(feature = "logging")]
-    tracing::warn!(event = "a2a.error", request_id = ?id, rpc_error_code = error.code, "A2A 请求失败：错误详情见 JSON-RPC 响应中的 error");
-    Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":error.code,"message":error.message}}))
+    tracing::warn!(event = "a2a.error", request_id = ?request_id, rpc_error_code = error.code, "A2A 请求失败：错误详情见 JSON-RPC 响应中的 error");
+    Json(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":error.code,"message":error.message}}))
         .into_response()
 }
 
