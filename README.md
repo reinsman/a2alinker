@@ -1,9 +1,18 @@
 # a2alinker
 
-使用 Rust 把本地 pi、Codex 提供为 A2A 1.0 服务。安装并配置好原生 agent 后，在项目目录运行即可。
+使用 Rust 把本地 pi、Codex 提供为 A2A 1.0 服务。仓库包含两个 Cargo 包：
+
+| Cargo 包名 | 用途 | 可执行文件名 |
+| --- | --- | --- |
+| `a2alinker` | 供 Rust daemon 调用的库 | 无 |
+| `a2alinker-cli` | 命令行程序，调用上述库 | `a2alinker` |
+
+`a2alinker-cli` 是 `cargo build -p`、`cargo run -p` 使用的包名；生成的命令仍叫 `a2alinker`，由命令行包中 `[[bin]].name = "a2alinker"` 指定。
+
+安装并配置好原生 agent 后，在仓库根目录构建命令行包并启动：
 
 ```bash
-cargo build --release --locked
+cargo build -p a2alinker-cli --release --locked
 
 ./target/release/a2alinker serve --name Alan --desc "项目开发助手"  # 默认 pi
 ./target/release/a2alinker serve pi --name Alan --desc "项目开发助手"
