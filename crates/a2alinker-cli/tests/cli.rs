@@ -227,6 +227,7 @@ fn instance_identity_survives_restart_and_rejects_another_agent_before_launch() 
     let mut wrong = Running::start(
         root,
         &[
+            "--agent",
             "codex",
             "--name",
             "Alan",
@@ -373,6 +374,7 @@ fn occupied_port_is_incremented_and_card_describes_the_actual_codex_service() {
     let mut server = Running::start(
         root,
         &[
+            "--agent",
             "codex",
             "--listen",
             &port,
@@ -468,6 +470,7 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
     let mut alan = Running::start_with_log(
         root,
         &[
+            "--agent",
             "pi",
             "--name",
             "Alan",
@@ -486,6 +489,7 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
     let mut bob = Running::start_with_log(
         root,
         &[
+            "--agent",
             "codex",
             "--name",
             "Bob",
@@ -528,6 +532,7 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
     let mut duplicate = Running::start_with_log(
         root,
         &[
+            "--agent",
             "pi",
             "--name",
             "Alan",
@@ -561,6 +566,7 @@ fn named_instances_share_a_storage_root_and_resume_their_own_tasks() {
     let mut resumed = Running::start_with_log(
         root,
         &[
+            "--agent",
             "pi",
             "--name",
             "Alan",

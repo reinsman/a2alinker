@@ -15,8 +15,8 @@
 cargo build -p a2alinker-cli --release --locked
 
 ./target/release/a2alinker serve --name Alan --desc "项目开发助手"  # 默认 pi
-./target/release/a2alinker serve pi --name Alan --desc "项目开发助手"
-./target/release/a2alinker serve codex --name Bob --desc "代码审查助手"
+./target/release/a2alinker serve --agent pi --name Alan --desc "项目开发助手"
+./target/release/a2alinker serve --agent codex --name Bob --desc "代码审查助手"
 ./target/release/a2alinker serve --help
 ```
 
@@ -25,7 +25,7 @@ cargo build -p a2alinker-cli --release --locked
 ## 启动参数
 
 ```bash
-a2alinker serve codex \
+a2alinker serve --agent codex \
   --name Bob \
   --desc "负责当前项目的开发与代码检查" \
   --workspace /work/project \
@@ -35,7 +35,7 @@ a2alinker serve codex \
 
 | 参数 | 默认值与行为 |
 | --- | --- |
-| `AGENT` / `--agent` | `pi`，支持 `pi`、`codex`；位置参数优先 |
+| `--agent` | `pi`，支持 `pi`、`codex`；也可通过 `A2ALINKER_AGENT` 设置，命令行优先 |
 | `--name` | 必填，无默认值；实例名字，也是 Agent Card 中的简短名字 |
 | `--desc` | 新实例必填；已有实例省略时沿用本地描述，显式填写时更新描述 |
 | `--workspace` | 当前进程的工作目录 |
@@ -69,9 +69,9 @@ a2alinker serve codex \
 
 ```bash
 # 首次创建必须提供名字和描述
-a2alinker serve pi --name Alan --desc "项目开发助手"
+a2alinker serve --agent pi --name Alan --desc "项目开发助手"
 # 再次启动可以省略描述
-a2alinker serve pi --name Alan
+a2alinker serve --agent pi --name Alan
 ```
 
 新实例缺少 `--desc`，或描述只有空白字符时，会直接报错。旧版本未保存描述，首次升级启动需补充一次 `--desc`；程序会核对旧任务和原生进程目录中的 agent 类型，发现不一致或无法确定类型时会报错，不会覆盖原有实例。
@@ -79,7 +79,7 @@ a2alinker serve pi --name Alan
 每个参数还支持对应的环境变量，命令行优先；完整列表见 `serve --help`。例如：
 
 ```bash
-A2ALINKER_NAME=Alan A2ALINKER_DESC="项目开发助手" A2ALINKER_WORKSPACE=/work/project a2alinker serve pi
+A2ALINKER_NAME=Alan A2ALINKER_DESC="项目开发助手" A2ALINKER_WORKSPACE=/work/project a2alinker serve --agent pi
 ```
 
 ## 沿用本地 agent
@@ -99,14 +99,14 @@ A2ALINKER_NAME=Alan A2ALINKER_DESC="项目开发助手" A2ALINKER_WORKSPACE=/wor
 如果 agent 需要先切换 nvm 或设置代理，可使用 `--prepare`：
 
 ```bash
-a2alinker serve pi --name Alan --desc "项目开发助手" \
+a2alinker serve --agent pi --name Alan --desc "项目开发助手" \
   --prepare 'source "$HOME/.nvm/nvm.sh" --no-use && nvm use --silent 24.20.0'
 
-a2alinker serve codex --name Bob --desc "代码审查助手" \
+a2alinker serve --agent codex --name Bob --desc "代码审查助手" \
   --prepare 'export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890'
 
 # 多个准备动作使用 && 连接；也可以 source 自己的环境脚本
-a2alinker serve pi --name Alan --prepare 'source /path/to/agent-env.sh'
+a2alinker serve --agent pi --name Alan --prepare 'source /path/to/agent-env.sh'
 ```
 
 准备命令目前使用 Unix 的 `/bin/bash`，不自动读取 shell 启动文件；初始工作目录为 `--workspace`。每次创建原生进程时，先在 Bash 中执行准备命令，再通过 `exec` 启动 `--executable`（省略时为 `pi` / `codex`）。两者共享环境，因此需要用 `export` 导出变量；只是单独执行一个脚本，脚本内的环境修改不会传回当前 Bash，应使用 `source`。

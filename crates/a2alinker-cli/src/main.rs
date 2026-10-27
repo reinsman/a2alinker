@@ -66,16 +66,13 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 启动服务；省略 AGENT 时默认使用 pi。
+    /// 启动服务；省略 --agent 时默认使用 pi。
     Serve(Box<ServeArgs>),
 }
 
 #[derive(Debug, clap::Args)]
 struct ServeArgs {
-    /// Agent 类型；也可通过 --agent 指定。
-    #[arg(value_enum, value_name = "AGENT")]
-    backend: Option<AgentArg>,
-    /// Agent 类型，默认 pi；位置参数优先。
+    /// Agent 类型，默认 pi。
     #[arg(long, value_enum, env = "A2ALINKER_AGENT")]
     agent: Option<AgentArg>,
     /// 必填的实例名字，也是 Agent Card 名字，例如 Alan、Bob。
@@ -160,14 +157,8 @@ impl Args {
 
 impl ServeArgs {
     fn into_options(self) -> Result<Options> {
-        // 位置参数优先，其次是 --agent（也可来自环境变量），最后默认 Pi。
-        let agent_argument = match self.backend {
-            Some(agent) => agent,
-            None => self.agent.unwrap_or_default(),
-        };
-
         let mut options = Options::default();
-        options.agent.kind = AgentKind::from(agent_argument);
+        options.agent.kind = AgentKind::from(self.agent.unwrap_or_default());
         options.agent.executable = match self.executable {
             Some(path) if !path.as_os_str().to_string_lossy().trim().is_empty() => Some(path),
             _ => None,
@@ -239,10 +230,10 @@ mod tests {
     }
 
     #[test]
-    fn positional_and_flag_agent_selection_are_supported() {
+    fn flag_agent_selection_is_supported() {
         for (mut args, expected) in [
-            (vec!["a2alinker", "serve", "pi"], AgentKind::Pi),
-            (vec!["a2alinker", "serve", "codex"], AgentKind::Codex),
+            (vec!["a2alinker", "serve"], AgentKind::Pi),
+            (vec!["a2alinker", "serve", "--agent", "pi"], AgentKind::Pi),
             (
                 vec!["a2alinker", "serve", "--agent", "codex"],
                 AgentKind::Codex,
@@ -257,6 +248,18 @@ mod tests {
                     .agent
                     .kind,
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn positional_agent_selection_is_rejected() {
+        for agent in ["pi", "codex"] {
+            assert_eq!(
+                Args::try_parse_from(["a2alinker", "serve", agent, "--name", "Alan"])
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::UnknownArgument
             );
         }
     }

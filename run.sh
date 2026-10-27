@@ -18,4 +18,4 @@ export A2ALINKER_PREPARE='
     nvm use node
 '
 
-exec "$binary" serve pi "$@"
+exec "$binary" serve "$@"
