@@ -9,6 +9,7 @@
 
 mod a2a;
 mod adapters;
+pub mod native;
 pub mod options;
 mod runtime;
 mod server;

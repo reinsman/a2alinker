@@ -304,3 +304,9 @@ cargo test --workspace --all-targets --locked
 workspace 测试中，命令行包会启用库的日志；上面的两条 `-p a2alinker` 测试分别验证库的默认无日志和显式开启日志的行为。
 
 需要 Rust 1.88+，已安装的 pi / Codex，以及用于测试的 Python 3。集成测试使用独立子进程，不调用真实模型。本包使用 `unsafe_code = "forbid"`，不包含自身的 unsafe 实现。学习笔记保留在本地 `docs/`，不纳入 Git 跟踪。
+
+## 无 HTTP 的原生执行 API
+
+`a2alinker::native` 公开已有的 `AdapterContext`、`AgentSession`、`AgentEvent`、交互类型、`create_session` 与 `validate_reply`。Rust daemon 可在自身进程内复用原生适配器：调用 `create_session` 直接启动 Codex/Pi 子进程，返回会话持有 stdin/stdout 管道；无需 `Server::start`，不绑定 HTTP 端口、不创建 A2A Gateway。
+
+该低层 API 的宿主负责会话缓存、事件持久化、审批回复、取消与进程生命周期；现有独立 A2A 服务仍由 `Server` 管理。reind 第一阶段仅引用这套 API，实际执行接线仍待完成。
