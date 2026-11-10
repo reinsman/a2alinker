@@ -77,6 +77,8 @@ pub struct AdapterContext {
 pub trait AgentSession: Send {
     fn native_id(&self) -> &str;
     fn is_alive(&mut self) -> bool;
+    /// 宿主确认取消/终态前，终止进程组并等待直接子进程退出。
+    async fn shutdown(&mut self) -> Result<()>;
     async fn run(
         &mut self,
         prompt: &str,

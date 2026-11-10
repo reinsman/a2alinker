@@ -9,8 +9,8 @@ use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome, canonical,
-    process::JsonlProcess,
+    AdapterContext, AgentEvent, AgentSession, Interaction, InteractionReply, RunOutcome, ToolEvent,
+    ToolPhase, canonical, process::JsonlProcess,
 };
 
 pub struct CodexSession {
@@ -85,6 +85,10 @@ impl AgentSession for CodexSession {
         self.process.is_alive()
     }
 
+    async fn shutdown(&mut self) -> Result<()> {
+        self.process.shutdown().await
+    }
+
     async fn run(
         &mut self,
         prompt: &str,
@@ -109,6 +113,7 @@ impl AgentSession for CodexSession {
         let mut deadline = Instant::now() + Duration::from_secs(86400 * 365);
         // 客户端使用新的 interactionId；此表保留它与原生 JSON-RPC 请求 ID 的对应关系。
         let mut pending = HashMap::<String, Value>::new();
+        let mut tool_output = HashMap::<String, String>::new();
         loop {
             tokio::select! {
                 biased;
@@ -161,8 +166,32 @@ impl AgentSession for CodexSession {
                             events.send(AgentEvent::OutputComplete { item_id:item["id"].as_str().context("Codex message missing id")?.into(),
                                 text:item["text"].as_str().unwrap_or("").into() }).await?;
                         }
-                        "item/started" if params["item"]["type"] == "commandExecution" => {
-                            events.send(AgentEvent::Progress("Running command".into())).await?;
+                        "item/started" | "item/completed" if matches!(params["item"]["type"].as_str(), Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall")) => {
+                            let item = &params["item"];
+                            let id = item["id"].as_str().context("Codex tool missing item id")?;
+                            let complete = method == "item/completed";
+                            if complete { tool_output.remove(id); }
+                            events.send(AgentEvent::Tool(ToolEvent {
+                                call_id: id.into(), name: item["type"].as_str().unwrap().into(),
+                                phase: if complete { ToolPhase::End } else { ToolPhase::Start },
+                                arguments: Some(json!({"command":item.get("command"), "changes":item.get("changes"), "tool":item.get("tool"), "arguments":item.get("arguments")})),
+                                result: complete.then(|| json!({"output":item.get("aggregatedOutput"), "exitCode":item.get("exitCode"), "result":item.get("result"), "status":item.get("status")})),
+                                is_error: complete.then_some(matches!(item["status"].as_str(), Some("failed" | "declined")) || item["exitCode"].as_i64().is_some_and(|code| code != 0)),
+                            })).await?;
+                        }
+                        "item/commandExecution/outputDelta" => {
+                            let id = params["itemId"].as_str().context("Codex tool output missing item id")?;
+                            let output = tool_output.entry(id.into()).or_default();
+                            let delta = params["delta"].as_str().context("Codex tool output missing delta")?;
+                            ensure!(output.len().saturating_add(delta.len()) <= 8 * 1024 * 1024, "Codex tool output exceeded 8 MiB");
+                            output.push_str(delta);
+                            events.send(AgentEvent::Tool(ToolEvent { call_id:id.into(), name:"commandExecution".into(), phase:ToolPhase::Update, arguments:None, result:Some(json!({"output":output})), is_error:None })).await?;
+                        }
+                        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                            let id = params["itemId"].as_str().context("Codex reasoning missing item id")?;
+                            let text = params["delta"].as_str().context("Codex reasoning missing delta")?;
+                            let index = params.get("summaryIndex").or_else(|| params.get("contentIndex")).and_then(Value::as_u64).unwrap_or(0);
+                            events.send(AgentEvent::Reasoning { item_id:format!("{id}-{index}"), text:text.into(), append:true, last_chunk:false }).await?;
                         }
                         "turn/completed" if params["turn"]["id"] == turn_id => {
                             return match params["turn"]["status"].as_str() {

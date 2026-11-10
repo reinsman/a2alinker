@@ -96,7 +96,7 @@ pub(crate) fn tool_event(task: &mut Task, event: ToolEvent) -> TaskStatusUpdateE
 
 /// 对结构化字段名做有限脱敏；自由文本（如 shell 命令、文件内容）无法可靠识别密钥。
 /// 因此不能把这个函数当作完整的凭据过滤器，也不能把原始过程报文写入日志。
-fn redact_fields(value: Value) -> Value {
+pub fn redact_fields(value: Value) -> Value {
     match value {
         Value::Object(fields) => Value::Object(
             fields

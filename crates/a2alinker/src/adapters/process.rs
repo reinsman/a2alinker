@@ -173,7 +173,16 @@ impl JsonlProcess {
 
     /// 从读取任务的通道中取一条报文；通道关闭说明协议流已结束。
     async fn raw_next(&mut self) -> Result<Value> {
-        match self.incoming_messages.recv().await {
+        let message = tokio::select! {
+            biased;
+            message = self.incoming_messages.recv() => message,
+            status = self.child.wait() => {
+                // 工具可能继承 stdout；不能依赖 EOF 才发现主进程已经崩溃。
+                self.group.terminate();
+                bail!("agent process exited before the protocol completed: {}", status?);
+            }
+        };
+        match message {
             Some(result) => result,
             None => bail!(
                 "agent protocol stream closed (process status: {:?}); check --prepare and --executable if startup failed",
@@ -204,6 +213,18 @@ impl JsonlProcess {
     pub fn terminate(&mut self) {
         self.group.terminate();
         let _ = self.child.start_kill();
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.group.terminate_checked()?;
+        self.child.start_kill()?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
+            .await
+            .context("agent process did not exit after termination")??;
+        for reader in &self.readers {
+            reader.abort();
+        }
+        Ok(())
     }
 }
 

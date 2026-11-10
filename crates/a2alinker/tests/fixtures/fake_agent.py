@@ -141,6 +141,12 @@ def run(prompt, count):
         emit({"type": "message_end", "message": {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": "transient failure"}})
         emit({"type": "agent_end", "messages": [], "willRetry": True})
         time.sleep(0.05)
+    if not PI and prompt == "execution":
+        note("item/reasoning/summaryTextDelta", {"turnId": TURN, "itemId": "reasoning-1", "summaryIndex": 0, "delta": "检查仓库结构。"})
+        note("item/started", {"turnId": TURN, "item": {"type": "commandExecution", "id": "call-bash", "command": "ls -la", "status": "inProgress"}})
+        note("item/commandExecution/outputDelta", {"turnId": TURN, "itemId": "call-bash", "delta": "文件A\n"})
+        note("item/commandExecution/outputDelta", {"turnId": TURN, "itemId": "call-bash", "delta": "文件B\n"})
+        note("item/completed", {"turnId": TURN, "item": {"type": "commandExecution", "id": "call-bash", "command": "ls -la", "status": "completed", "aggregatedOutput": "文件A\n文件B\n", "exitCode": 0}})
     if PI and prompt in ("execution", "execution-pause", "reasoning-large", "arguments-large", "tool-large"):
         if not execution(prompt):
             return

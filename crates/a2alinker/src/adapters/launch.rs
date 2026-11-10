@@ -69,8 +69,12 @@ impl ProcessGroup {
     }
 
     pub(super) fn terminate(&mut self) {
+        let _ = self.terminate_checked();
+    }
+
+    pub(super) fn terminate_checked(&mut self) -> Result<()> {
         #[cfg(unix)]
-        if let Some(id) = self.0.take()
+        if let Some(id) = self.0
             && let Ok(raw_id) = i32::try_from(id)
             && raw_id > 1
         {
@@ -78,8 +82,12 @@ impl ProcessGroup {
                 sys::signal::{Signal, killpg},
                 unistd::Pid,
             };
-            let _ = killpg(Pid::from_raw(raw_id), Signal::SIGKILL);
+            match killpg(Pid::from_raw(raw_id), Signal::SIGKILL) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => self.0 = None,
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(())
     }
 }
 

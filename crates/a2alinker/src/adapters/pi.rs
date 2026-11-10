@@ -80,6 +80,10 @@ impl AgentSession for PiSession {
         self.process.is_alive()
     }
 
+    async fn shutdown(&mut self) -> Result<()> {
+        self.process.shutdown().await
+    }
+
     async fn run(
         &mut self,
         prompt: &str,
